@@ -1,795 +1,613 @@
-import json
-import numpy as np
-import pandas as pd
 import streamlit as st
-import altair as alt
+import pandas as pd
+import numpy as np
+import json
+import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
-# ============================
-# Seguridad opcional (password)
-# ============================
-def auth_gate():
-    pwd = st.secrets.get("APP_PASSWORD", "")
-    if not pwd:
-        return True
+# ============================================================
+# (Opcional) Password: define APP_PASSWORD en Streamlit Secrets
+# ============================================================
+APP_PASSWORD = st.secrets.get("APP_PASSWORD", "")
+if APP_PASSWORD:
+    st.sidebar.subheader("🔐 Acceso")
+    pwd = st.sidebar.text_input("Contraseña", type="password")
+    if pwd != APP_PASSWORD:
+        st.sidebar.warning("Contraseña incorrecta.")
+        st.stop()
 
-    if "authed" not in st.session_state:
-        st.session_state.authed = False
-    if st.session_state.authed:
-        return True
 
-    with st.sidebar:
-        st.subheader("🔐 Acceso")
-        entered = st.text_input("Contraseña", type="password")
-        if st.button("Entrar"):
-            if entered == pwd:
-                st.session_state.authed = True
-                st.success("Acceso concedido")
-                st.rerun()
-            else:
-                st.error("Contraseña incorrecta")
-    st.stop()
-
-auth_gate()
-
-# ============================
-# Helpers / traducciones
-# ============================
-DIR_MAP = {1: "Compra (Long)", -1: "Venta (Short)"}
-
-REASON_MAP_ES = {
-    "SL": "Stop Loss (SL)",
-    "TP": "Take Profit (TP)",
-    "BE": "Break-even (BE)",
-    "TRAIL": "Trailing Stop",
-    "SESSION_END": "Fin de sesión",
-    "TIME_STOP": "Time stop / Guardia diaria",
-    "MANUAL": "Manual / Forzado",
-    "": "Sin etiqueta",
-    None: "Sin etiqueta",
-}
-
-def reason_to_es(x: str) -> str:
-    x = "" if x is None else str(x).strip().upper()
-    return REASON_MAP_ES.get(x, x)
-
-def side_from_dir(d):
-    try:
-        d = int(d)
-    except:
-        return "Desconocido"
-    return DIR_MAP.get(d, "Desconocido")
-
-def load_jsonl_bytes(data: bytes):
-    rows = []
+# ============================================================
+# Helpers
+# ============================================================
+def parse_jsonl_bytes(b: bytes):
+    txt = b.decode("utf-8", errors="replace")
+    recs = []
     bad = 0
-    for i, line in enumerate(data.decode("utf-8", errors="ignore").splitlines(), 1):
+    for line in txt.splitlines():
         line = line.strip()
         if not line:
             continue
         try:
-            obj = json.loads(line)
-            obj["_line"] = i
-            rows.append(obj)
+            recs.append(json.loads(line))
         except Exception:
             bad += 1
+    return recs, bad
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df, bad
 
-    df["type"] = df.get("type", "").astype(str).str.upper()
-    df["ts_parsed"] = pd.to_datetime(df.get("ts"), errors="coerce")
-    return df, bad
-
-# ============================
-# Emparejamiento robusto
-# ============================
-def _infer_dir_from_entry_fields(row) -> float:
-    """
-    Inferencia SOLO si tenemos datos del ENTRY:
-    - trigger vs orHigh/orLow
-    """
-    trig = row.get("trigger", np.nan)
-    oh   = row.get("orHigh", np.nan)
-    ol   = row.get("orLow", np.nan)
-
-    if pd.isna(trig) or pd.isna(oh) or pd.isna(ol):
-        return np.nan
-
-    if trig >= oh:
-        return 1.0
-    if trig <= ol:
-        return -1.0
-    return np.nan
-
-def pair_trades(df: pd.DataFrame, time_fallback_minutes: int = 45) -> pd.DataFrame:
-    entries_raw = df[df["type"] == "ENTRY"].copy()
-    exits_raw   = df[df["type"] == "EXIT"].copy()
-
-    if "dir" in entries_raw.columns:
-        entries_raw.rename(columns={"dir": "dir_entry"}, inplace=True)
-    if "dir" in exits_raw.columns:
-        exits_raw.rename(columns={"dir": "dir_exit"}, inplace=True)
-
-    # numéricos si existen
-    for c in ["dir_entry", "dir_exit", "trigger", "orHigh", "orLow", "orSize", "atr", "ewo", "deltaRatio",
-              "tradeRealized", "maxUnreal", "minUnreal"]:
-        if c in entries_raw.columns:
-            entries_raw[c] = pd.to_numeric(entries_raw[c], errors="coerce")
-        if c in exits_raw.columns:
-            exits_raw[c] = pd.to_numeric(exits_raw[c], errors="coerce")
-
-    # ===== 1) Pair por atmId =====
-    entry_cols = [
-        "atmId","ts_parsed","dir_entry","template","orderType","trigger",
-        "orHigh","orLow","orSize","ewo","atr","useAtrEngine","atrSlMult",
-        "tp1R","tp2R","tsBehindTP1Atr","trailStepTicks","deltaRatio","dailyPnL"
-    ]
-    entry_cols = [c for c in entry_cols if c in entries_raw.columns]
-    e_by_id = (entries_raw.sort_values("ts_parsed")
-                      .groupby("atmId", as_index=False)[entry_cols]
-                      .first()
-                      .rename(columns={"ts_parsed":"entry_time"}))
-
-    exit_cols = [
-        "atmId","ts_parsed","outcome","exitReason","tradeRealized","dayRealized",
-        "maxUnreal","minUnreal","forcedCloseReason","dailyHalt","dir_exit"
-    ]
-    exit_cols = [c for c in exit_cols if c in exits_raw.columns]
-    x_by_id = (exits_raw.sort_values("ts_parsed")
-                      .groupby("atmId", as_index=False)[exit_cols]
-                      .last()
-                      .rename(columns={"ts_parsed":"exit_time"}))
-
-    t = x_by_id.merge(e_by_id, on="atmId", how="left")
-    t["paired_by_time"] = False
-    t["paired_strong"] = t["entry_time"].notna()  # por atmId
-
-    # ===== 2) Fallback por tiempo =====
-    missing_mask = t["entry_time"].isna()
-    if missing_mask.any() and not entries_raw.empty:
-        window = pd.Timedelta(minutes=time_fallback_minutes)
-
-        e2 = entries_raw.copy()
-        e2 = e2[e2["ts_parsed"].notna()].sort_values("ts_parsed").reset_index(drop=True)
-        e2.rename(columns={"ts_parsed":"entry_time_raw"}, inplace=True)
-
-        used_entry_idx = set()
-
-        unresolved = t[missing_mask & t["exit_time"].notna()].copy()
-        unresolved = unresolved.sort_values("exit_time").reset_index()
-
-        ptr = 0
-        candidates = []
-
-        for _, row in unresolved.iterrows():
-            exit_time = row["exit_time"]
-
-            while ptr < len(e2) and e2.loc[ptr, "entry_time_raw"] <= exit_time:
-                candidates.append(ptr)
-                ptr += 1
-
-            best = None
-            for idx in reversed(candidates):
-                if idx in used_entry_idx:
-                    continue
-                et = e2.loc[idx, "entry_time_raw"]
-                if exit_time - et <= window:
-                    best = idx
-                    break
-                else:
-                    break
-
-            if best is None:
-                continue
-
-            used_entry_idx.add(best)
-            ridx = row["index"]
-
-            for col in [
-                "dir_entry","template","orderType","trigger",
-                "orHigh","orLow","orSize","ewo","atr","useAtrEngine","atrSlMult",
-                "tp1R","tp2R","tsBehindTP1Atr","trailStepTicks","deltaRatio","dailyPnL"
-            ]:
-                if col in e2.columns:
-                    t.loc[ridx, col] = e2.loc[best, col]
-
-            t.loc[ridx, "entry_time"] = e2.loc[best, "entry_time_raw"]
-            t.loc[ridx, "paired_by_time"] = True
-            t.loc[ridx, "paired_strong"] = False
-
-    # ===== 3) dir final =====
-    if "dir_entry" in t.columns and "dir_exit" in t.columns:
-        t["dir"] = pd.to_numeric(t["dir_entry"], errors="coerce").combine_first(
-            pd.to_numeric(t["dir_exit"], errors="coerce")
-        )
-    elif "dir_entry" in t.columns:
-        t["dir"] = pd.to_numeric(t["dir_entry"], errors="coerce")
-    elif "dir_exit" in t.columns:
-        t["dir"] = pd.to_numeric(t["dir_exit"], errors="coerce")
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    if "ts" in df.columns:
+        df["ts_parsed"] = pd.to_datetime(df["ts"], errors="coerce")
+    elif "timestamp" in df.columns:
+        df["ts_parsed"] = pd.to_datetime(df["timestamp"], errors="coerce")
     else:
-        t["dir"] = np.nan
+        df["ts_parsed"] = pd.NaT
 
-    # ===== 4) inferencia por trigger/orHigh/orLow si aún falta dir =====
-    still = t["dir"].isna()
-    if still.any():
-        inferred = t[still].apply(_infer_dir_from_entry_fields, axis=1)
-        t.loc[still, "dir"] = inferred
+    # Compat keys (por si logs viejos cambiaron nombres)
+    rename_map = {
+        "slAtrMult": "atrSlMult",
+        "tpR": "tp1R",
+        "useAtrOverride": "useAtrEngine",
+    }
+    for old, new in rename_map.items():
+        if old in df.columns and new not in df.columns:
+            df[new] = df[old]
 
-    # numéricos safe
-    for c in ["tradeRealized","dayRealized","maxUnreal","minUnreal","orSize","atr","ewo","deltaRatio"]:
-        if c in t.columns:
-            t[c] = pd.to_numeric(t[c], errors="coerce")
+    if "type" not in df.columns:
+        df["type"] = ""
 
-    # Outcome robusto
-    default_outcome = pd.Series(
-        np.where(t.get("tradeRealized", 0).fillna(0) >= 0, "WIN", "LOSS"),
-        index=t.index
-    )
-    if "outcome" not in t.columns:
-        t["outcome"] = default_outcome
-    else:
-        t["outcome"] = t["outcome"].astype("string")
-        missing = t["outcome"].isna()
-        t.loc[missing, "outcome"] = default_outcome.loc[missing]
+    return df
 
-    t["exitReason"] = t.get("exitReason", "").fillna("").astype(str)
-    t["exitReason_ES"] = t["exitReason"].map(reason_to_es)
-    t["forcedCloseReason"] = t.get("forcedCloseReason", "").fillna("").astype(str)
 
-    t["has_entry"] = t["entry_time"].notna()
-    t["duration_sec"] = (t["exit_time"] - t["entry_time"]).dt.total_seconds()
-    t["dur_min"] = t["duration_sec"] / 60.0
-
-    t = t.sort_values("exit_time").reset_index(drop=True)
-    t["equity"] = t.get("tradeRealized", 0).fillna(0).cumsum()
-    t["equity_peak"] = t["equity"].cummax()
-    t["drawdown"] = t["equity"] - t["equity_peak"]
-
-    t["exit_date"] = pd.to_datetime(t["exit_time"]).dt.date
-    t["exit_hour"] = pd.to_datetime(t["exit_time"]).dt.hour
-
-    t["lado"] = t["dir"].apply(side_from_dir)
-
-    return t
-
-# ============================
-# Métricas
-# ============================
-def profit_factor(t: pd.DataFrame) -> float:
-    wins = t.loc[t["tradeRealized"] > 0, "tradeRealized"].sum()
-    losses = t.loc[t["tradeRealized"] < 0, "tradeRealized"].sum()
+def profit_factor(trades: pd.DataFrame) -> float:
+    wins = trades.loc[trades["tradeRealized"] > 0, "tradeRealized"].sum()
+    losses = trades.loc[trades["tradeRealized"] < 0, "tradeRealized"].sum()
     if losses == 0:
         return np.nan
     return float(wins / abs(losses))
 
-def streaks_from_pnl(pnls: pd.Series, reset_each_day: bool, dates: pd.Series | None):
-    max_w = 0
-    max_l = 0
-    cur_w = 0
-    cur_l = 0
 
-    prev_date = None
-    for i, v in enumerate(pnls.fillna(0).tolist()):
-        if reset_each_day and dates is not None:
-            d = dates.iloc[i]
-            if prev_date is None:
-                prev_date = d
-            elif d != prev_date:
-                # reset al cambiar el día
-                cur_w = 0
-                cur_l = 0
-                prev_date = d
-
-        if v > 0:
-            cur_w += 1
-            cur_l = 0
-            max_w = max(max_w, cur_w)
-        elif v < 0:
-            cur_l += 1
-            cur_w = 0
-            max_l = max(max_l, cur_l)
+def max_streak(outcomes: pd.Series, target: str):
+    best_len = 0
+    cur = 0
+    best_end = None
+    for i, o in enumerate(outcomes.tolist()):
+        if o == target:
+            cur += 1
+            if cur > best_len:
+                best_len = cur
+                best_end = i
         else:
-            cur_w = 0
-            cur_l = 0
+            cur = 0
+    if best_len == 0:
+        return 0, None, None
+    start = best_end - best_len + 1
+    return best_len, start, best_end
 
-    return max_w, max_l
 
-def summary_block(t: pd.DataFrame, streak_reset_each_day: bool) -> dict:
+def drawdown_details(t: pd.DataFrame):
+    if t.empty:
+        return np.nan, None, None
+    dd = t["drawdown"].fillna(0)
+    trough_idx = int(dd.idxmin())
+    trough_time = t.loc[trough_idx, "exit_time"]
+    peak_idx = int(t.loc[:trough_idx, "equity"].idxmax())
+    peak_time = t.loc[peak_idx, "exit_time"]
+    return float(dd.min()), peak_time, trough_time
+
+
+def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    1 fila por trade (atmId):
+    - EXIT: último por atmId
+    - ENTRY: primero por atmId
+    Si falta ENTRY -> lado = "Sin datos (faltó ENTRY)" (NO inventamos)
+    """
+    entries = df[df["type"] == "ENTRY"].copy()
+    exits = df[df["type"] == "EXIT"].copy()
+
+    # ENTRY (primero por atmId)
+    entry_cols = [
+        "atmId", "ts_parsed", "dir",
+        "template", "orderType", "trigger",
+        "orHigh", "orLow", "orSize",
+        "ewo", "atr", "useAtrEngine", "atrSlMult",
+        "tp1R", "tp2R", "tsBehindTP1Atr", "trailStepTicks",
+        "deltaRatio", "dailyPnL"
+    ]
+    entry_cols = [c for c in entry_cols if c in entries.columns]
+
+    if len(entry_cols) == 0:
+        e1 = pd.DataFrame(columns=["atmId", "entry_time"])
+    else:
+        e1 = (entries.sort_values("ts_parsed")
+                    .groupby("atmId", as_index=False)[entry_cols]
+                    .first()
+                    .rename(columns={"ts_parsed": "entry_time"}))
+
+    # EXIT (último por atmId)
+    exit_cols = [
+        "atmId", "ts_parsed",
+        "outcome", "exitReason", "tradeRealized", "dayRealized",
+        "maxUnreal", "minUnreal", "forcedCloseReason", "dailyHalt"
+    ]
+    exit_cols = [c for c in exit_cols if c in exits.columns]
+
+    xlast = (exits.sort_values("ts_parsed")
+                  .groupby("atmId", as_index=False)[exit_cols]
+                  .last()
+                  .rename(columns={"ts_parsed": "exit_time"}))
+
+    # JOIN
+    t = xlast.merge(e1, on="atmId", how="left")
+
+    # Numeric
+    for c in [
+        "tradeRealized", "dayRealized", "maxUnreal", "minUnreal",
+        "orSize", "atr", "ewo", "deltaRatio", "dir",
+        "atrSlMult", "tp1R", "tp2R", "trailStepTicks"
+    ]:
+        if c in t.columns:
+            t[c] = pd.to_numeric(t[c], errors="coerce")
+
+    t["has_entry"] = t.get("entry_time", pd.NaT).notna()
+
+    # outcome robusto
+    calc_outcome = pd.Series(np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS"), index=t.index)
+    if "outcome" not in t.columns:
+        t["outcome"] = calc_outcome
+    else:
+        t["outcome"] = t["outcome"].where(t["outcome"].notna(), calc_outcome)
+
+    # duration
+    if "entry_time" in t.columns and "exit_time" in t.columns:
+        t["duration_sec"] = (t["exit_time"] - t["entry_time"]).dt.total_seconds()
+    else:
+        t["duration_sec"] = np.nan
+
+    # sort
+    t = t.sort_values("exit_time").reset_index(drop=True)
+
+    # equity & drawdown
+    t["equity"] = t["tradeRealized"].fillna(0).cumsum()
+    t["equity_peak"] = t["equity"].cummax()
+    t["drawdown"] = t["equity"] - t["equity_peak"]
+
+    # time buckets
+    t["exit_date"] = pd.to_datetime(t["exit_time"]).dt.date
+    t["exit_hour"] = pd.to_datetime(t["exit_time"]).dt.hour
+    t["weekday"] = pd.to_datetime(t["exit_time"]).dt.day_name()
+
+    # side
+    def side_label(x):
+        if pd.isna(x):
+            return "Sin datos (faltó ENTRY)"
+        if x > 0:
+            return "Compra (Long)"
+        if x < 0:
+            return "Venta (Short)"
+        return "Sin datos (dir=0)"
+
+    if "dir" in t.columns:
+        t["lado"] = t["dir"].apply(side_label)
+    else:
+        t["lado"] = "Sin datos (faltó ENTRY)"
+
+    return t
+
+
+def summarize(t: pd.DataFrame) -> dict:
+    if t.empty:
+        return {}
     n = len(t)
-    win_rate = float((t["tradeRealized"] > 0).mean()) if n else np.nan
-    pf = profit_factor(t)
-    total = float(t["tradeRealized"].sum()) if n else 0.0
-    max_dd = float(t["drawdown"].min()) if n else 0.0
-    exp = float(t["tradeRealized"].mean()) if n else np.nan
-
-    max_win = float(t["tradeRealized"].max()) if n else 0.0
-    max_loss = float(t["tradeRealized"].min()) if n else 0.0
-
-    avg_win = float(t.loc[t["tradeRealized"] > 0, "tradeRealized"].mean()) if (t["tradeRealized"] > 0).any() else np.nan
-    avg_loss = float(t.loc[t["tradeRealized"] < 0, "tradeRealized"].mean()) if (t["tradeRealized"] < 0).any() else np.nan
-
-    best_streak, worst_streak = streaks_from_pnl(
-        t["tradeRealized"], reset_each_day=streak_reset_each_day, dates=t["exit_date"]
-    )
-
-    buys  = int((t["dir"] == 1).sum())
-    sells = int((t["dir"] == -1).sum())
-    unknown = int(t["dir"].isna().sum())
-
     wins = int((t["tradeRealized"] > 0).sum())
     losses = int((t["tradeRealized"] < 0).sum())
+    win_rate = (wins / n * 100) if n else np.nan
 
-    paired_by_time = int(t.get("paired_by_time", False).sum()) if "paired_by_time" in t.columns else 0
-    strong = int(t.get("paired_strong", False).sum()) if "paired_strong" in t.columns else 0
+    pf = profit_factor(t)
+    expectancy = float(t["tradeRealized"].mean()) if n else np.nan
+
+    max_dd, dd_peak_time, dd_trough_time = drawdown_details(t)
+
+    max_win = float(t["tradeRealized"].max())
+    max_loss = float(t["tradeRealized"].min())
+
+    wlen, ws, we = max_streak(t["outcome"], "WIN")
+    llen, ls, le = max_streak(t["outcome"], "LOSS")
 
     return {
-        "trades": n,
-        "buys": buys,
-        "sells": sells,
-        "unknown_dir": unknown,
-        "wins": wins,
-        "losses": losses,
-        "win_rate": win_rate,
-        "profit_factor": pf,
-        "total_pnl": total,
-        "max_drawdown": max_dd,
-        "expectancy": exp,
-        "max_win": max_win,
-        "max_loss": max_loss,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "best_streak": best_streak,
-        "worst_streak": worst_streak,
-        "paired_by_time": paired_by_time,
-        "paired_strong": strong,
+        "n": n, "wins": wins, "losses": losses, "win_rate": win_rate,
+        "pnl_total": float(t["tradeRealized"].sum()),
+        "pf": pf, "expectancy": expectancy,
+        "max_dd": max_dd, "dd_peak_time": dd_peak_time, "dd_trough_time": dd_trough_time,
+        "max_win": max_win, "max_loss": max_loss,
+        "best_win_streak": wlen, "best_loss_streak": llen,
+        "best_win_streak_idx": (ws, we),
+        "best_loss_streak_idx": (ls, le),
     }
 
-def interpretacion_rapida(s: dict):
-    msgs = []
-    warns = []
 
-    if s["trades"] < 20:
-        warns.append("Pocas operaciones en el filtro actual (<20). Las conclusiones pueden ser poco estables.")
+def metric_tag_ok(value, good_when="high"):
+    # Pequeña ayuda visual para consejos
+    if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
+        return "⚪"
+    if good_when == "high":
+        return "🟢" if value >= 1.2 else ("🟡" if value >= 1.0 else "🔴")
+    else:
+        return "🟢" if value <= -500 else ("🟡" if value <= -300 else "🔴")
 
-    if not np.isnan(s["profit_factor"]):
-        if s["profit_factor"] < 1.0:
-            warns.append(f"Profit Factor {s['profit_factor']:.2f} → este conjunto de reglas pierde dinero en promedio.")
-        elif s["profit_factor"] < 1.2:
-            warns.append(f"Profit Factor {s['profit_factor']:.2f} → ventaja débil (falta filtro / gestión / horario).")
-        else:
-            msgs.append(f"Profit Factor {s['profit_factor']:.2f} → parece haber ventaja estadística en este filtro.")
 
-    if s["max_drawdown"] < 0:
-        dd = abs(s["max_drawdown"])
-        pnl = abs(s["total_pnl"])
-        if pnl > 0 and (dd / pnl) > 0.7:
-            warns.append("Drawdown alto vs PnL total → estabilidad mejorable (filtros, daily stop, menos trades, evitar horas malas).")
+def make_bins_quantiles(df: pd.DataFrame, col: str, q: int):
+    s = df[col].dropna()
+    if len(s) < q * 10:
+        return None  # poca data
+    try:
+        bins = pd.qcut(df[col], q=q, duplicates="drop")
+        return bins
+    except Exception:
+        return None
 
-    if s["worst_streak"] >= 5:
-        warns.append(f"Racha perdedora máxima = {s['worst_streak']} → necesitas plan anti-rachas (daily stop, bajar tamaño, filtros).")
 
-    return msgs, warns
+def group_metrics(df: pd.DataFrame, group_col: str, min_trades: int):
+    rows = []
+    for g, sub in df.groupby(group_col):
+        n = len(sub)
+        if n < min_trades:
+            continue
+        wins = int((sub["tradeRealized"] > 0).sum())
+        wr = wins / n * 100
+        wr_adj = (wins + 1) / (n + 2) * 100  # smoothing (evita 2 trades=100% “perfecto”)
+        pf = profit_factor(sub)
+        exp = float(sub["tradeRealized"].mean())
+        pnl = float(sub["tradeRealized"].sum())
+        # Score ponderado: prioriza exp + tamaño de muestra
+        score = exp * np.log1p(n)
+        rows.append({
+            "Grupo": str(g),
+            "Trades": n,
+            "WinRate%": wr,
+            "WinRate Ajustado%": wr_adj,
+            "PF": pf,
+            "Expectancia": exp,
+            "PnL Total": pnl,
+            "Score (ponderado)": score,
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = out.sort_values("Score (ponderado)", ascending=False).reset_index(drop=True)
+    return out
 
-def side_breakdown(t: pd.DataFrame, streak_reset_each_day: bool) -> pd.DataFrame:
-    out = (t.groupby("lado", dropna=False)
-             .agg(
-                 trades=("atmId", "count"),
-                 wins=("tradeRealized", lambda x: int((x > 0).sum())),
-                 losses=("tradeRealized", lambda x: int((x < 0).sum())),
-                 win_rate=("tradeRealized", lambda x: float((x > 0).mean()) if len(x) else np.nan),
-                 total_pnl=("tradeRealized", "sum"),
-                 avg_pnl=("tradeRealized", "mean"),
-                 max_win=("tradeRealized", "max"),
-                 max_loss=("tradeRealized", "min"),
-             )
-             .reset_index())
 
-    out["profit_factor"] = [profit_factor(t[t["lado"] == lado]) for lado in out["lado"].tolist()]
+def advice_from_table(tbl: pd.DataFrame, title: str, min_trades: int):
+    if tbl is None or tbl.empty:
+        st.info(f"En **{title}** no hay suficiente muestra (mínimo {min_trades} trades por grupo).")
+        return
 
-    streak_w, streak_l = [], []
-    for lado in out["lado"].tolist():
-        g = t[t["lado"] == lado].sort_values("exit_time").reset_index(drop=True)
-        bw, wl = streaks_from_pnl(g["tradeRealized"], reset_each_day=streak_reset_each_day, dates=g["exit_date"])
-        streak_w.append(bw)
-        streak_l.append(wl)
-    out["racha_ganadora_max"] = streak_w
-    out["racha_perdedora_max"] = streak_l
+    best = tbl.iloc[0]
+    worst = tbl.iloc[-1]
 
-    return out.sort_values("trades", ascending=False)
+    st.markdown("**Consejos automáticos (basados en los datos):**")
+    st.write(
+        f"✅ Mejor grupo: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
+        f"PF={best['PF']:.2f} | Exp={best['Expectancia']:.1f} | PnL={best['PnL Total']:.0f}"
+    )
+    st.write(
+        f"⚠️ Peor grupo: **{worst['Grupo']}** | Trades={int(worst['Trades'])} | "
+        f"PF={worst['PF']:.2f} | Exp={worst['Expectancia']:.1f} | PnL={worst['PnL Total']:.0f}"
+    )
 
-# ============================
+    # Reglas simples para texto
+    if not np.isnan(best["PF"]) and best["PF"] < 1.0:
+        st.warning("⚠️ Incluso el “mejor” grupo tiene PF < 1.0 → faltan filtros o el sistema no tiene edge con estos datos.")
+    if not np.isnan(worst["PF"]) and worst["PF"] < 1.0:
+        st.warning("🧨 Hay grupos con PF < 1.0 → considera filtrarlos o ajustar SL/TP/horarios.")
+    if best["Trades"] < min_trades * 2:
+        st.info("ℹ️ El mejor grupo tiene muestra justa. Ideal: acumular más trades para confirmar.")
+
+
+def plot_equity_drawdown(t: pd.DataFrame):
+    fig1 = px.line(t, x="exit_time", y="equity", title="Equity (curva de capital)")
+    fig1.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
+
+    fig2 = px.line(t, x="exit_time", y="drawdown", title="Drawdown (caída desde el pico)")
+    fig2.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
+    fig2.add_hline(y=0, line_width=1, line_dash="dash")
+
+    return fig1, fig2
+
+
+def plot_pnl_hist(t: pd.DataFrame):
+    fig = px.histogram(t, x="tradeRealized", nbins=40, title="Distribución de PnL por trade")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+    fig.add_vline(x=0, line_width=1, line_dash="dash")
+    return fig
+
+
+def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, title: str):
+    bins = make_bins_quantiles(df_known, col, q)
+    if bins is None:
+        st.info(f"No hay suficiente data para crear rangos por cuantiles en **{title}**.")
+        return
+
+    tmp = df_known.copy()
+    tmp["_bin"] = bins.astype(str)
+
+    tbl = group_metrics(tmp, "_bin", min_trades=min_trades)
+    if tbl.empty:
+        st.info(f"En **{title}** no hay bins con mínimo {min_trades} trades.")
+        return
+
+    # Gráficos
+    fig_exp = px.bar(tbl, x="Grupo", y="Expectancia", title=f"{title} → Expectancia por rango (bins)")
+    fig_exp.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+    fig_exp.add_hline(y=0, line_width=1, line_dash="dash")
+
+    fig_pf = px.bar(tbl, x="Grupo", y="PF", title=f"{title} → Profit Factor por rango (bins)")
+    fig_pf.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+    fig_pf.add_hline(y=1.0, line_width=1, line_dash="dash")
+
+    st.plotly_chart(fig_exp, use_container_width=True)
+    st.plotly_chart(fig_pf, use_container_width=True)
+
+    st.dataframe(tbl, use_container_width=True)
+    advice_from_table(tbl, title=title, min_trades=min_trades)
+
+
+def plot_scatter_advanced(df_known: pd.DataFrame, xcol: str, title: str):
+    # Scatter más legible: verde arriba de 0, rojo abajo
+    tmp = df_known[[xcol, "tradeRealized", "exit_time", "lado", "exitReason"]].dropna().copy()
+    tmp["Resultado"] = np.where(tmp["tradeRealized"] >= 0, "Ganancia", "Pérdida")
+
+    fig = px.scatter(
+        tmp,
+        x=xcol,
+        y="tradeRealized",
+        color="Resultado",
+        color_discrete_map={"Ganancia": "green", "Pérdida": "red"},
+        hover_data=["exit_time", "lado", "exitReason", "tradeRealized"],
+        title=f"{title} (modo avanzado)"
+    )
+    fig.update_traces(marker=dict(size=6, opacity=0.55))
+    fig.add_hline(y=0, line_width=1, line_dash="dash")
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption("Cómo leerlo: si en cierto rango de X hay mayoría de puntos verdes y pocos rojos grandes → ese rango suele ser mejor.")
+
+
+def plot_hour_analysis(t: pd.DataFrame, min_trades: int):
+    # Tabla por hora: usa winrate ajustado + score ponderado (evita 2 trades = 100% engañoso)
+    tbl = group_metrics(t, "exit_hour", min_trades=min_trades)
+    if tbl.empty:
+        st.info(f"No hay suficientes trades por hora para min_trades={min_trades}.")
+        return
+
+    fig = px.bar(tbl, x="Grupo", y="Score (ponderado)", title="Horas con mejor score (ponderado por muestra)")
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(tbl, use_container_width=True)
+    advice_from_table(tbl, title="Hora de salida (exit_hour)", min_trades=min_trades)
+
+
+def plot_heatmap_weekday_hour(t: pd.DataFrame, min_trades: int):
+    # Heatmap de Expectancia por weekday x hour, pero oculta celdas con pocos trades
+    tmp = t.copy()
+    tmp["weekday_order"] = pd.Categorical(
+        tmp["weekday"],
+        categories=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+        ordered=True
+    )
+
+    agg = tmp.groupby(["weekday_order", "exit_hour"]).agg(
+        Trades=("tradeRealized", "size"),
+        Expectancia=("tradeRealized", "mean"),
+        PnL=("tradeRealized", "sum"),
+    ).reset_index()
+
+    agg.loc[agg["Trades"] < min_trades, "Expectancia"] = np.nan
+
+    pivot = agg.pivot(index="weekday_order", columns="exit_hour", values="Expectancia")
+    fig = px.imshow(
+        pivot,
+        aspect="auto",
+        title=f"Heatmap: Expectancia por Día x Hora (solo celdas con ≥ {min_trades} trades)",
+        origin="lower"
+    )
+    fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.caption("Cómo leerlo: celdas más altas (más positivas) = mejores combinaciones Día/Hora. Celdas vacías = poca muestra.")
+
+
+# ============================================================
 # UI
-# ============================
-st.title("📊 WIC_WLF2 Analizador")
-st.caption("Sube uno o varios archivos WIC_WLF2_YYYY-MM.jsonl → métricas claras, tablas legibles, gráficos y guía práctica.")
+# ============================================================
+st.title("📊 WIC_WLF2 Analizador (Plotly)")
 
-with st.expander("💡 Cómo leer esto", expanded=False):
-    st.markdown(
-        """
-**Curva de capital (Equity)**  
-- PnL acumulado trade a trade. Subida estable → mejor.
-
-**Drawdown (Caída desde máximos)**  
-- La peor caída desde el último máximo de equity (tu peor “dolor”).
-
-**Profit Factor (PF)**  
-- Ganancias / pérdidas.  
-- < 1.0 → pierde dinero  
-- 1.0–1.2 → débil  
-- > 1.2 → empieza a ser interesante (depende del riesgo)
-
-**Rachas**  
-- Conteo de wins/losses consecutivos según el orden temporal de los trades.  
-- Si activas “reset por día”, la racha se reinicia cada nuevo día de trading.
-        """
-    )
-
-with st.expander("🔒 Privacidad / sesiones", expanded=False):
-    st.markdown(
-        """
-- Cada persona que abre el link tiene **su propia sesión**.  
-- Tus amigos **no ven** tus archivos subidos (a menos que tú se los pases).  
-- Este app **no guarda** logs: solo analiza lo que se sube en esa sesión.
-        """
-    )
-
-uploads = st.file_uploader(
-    "📥 Sube archivos .jsonl (puedes subir varios meses)",
+uploaded = st.file_uploader(
+    "📤 Sube uno o varios archivos .jsonl (meses)",
     type=["jsonl"],
     accept_multiple_files=True
 )
 
-if not uploads:
-    st.info("Sube tu(s) JSONL para comenzar.")
+if not uploaded:
     st.stop()
 
-dfs = []
+all_records = []
 bad_total = 0
-for up in uploads:
-    df, bad = load_jsonl_bytes(up.getvalue())
+for uf in uploaded:
+    recs, bad = parse_jsonl_bytes(uf.getvalue())
     bad_total += bad
-    if df.empty:
-        st.warning(f"{up.name}: no se pudieron leer filas.")
-        continue
-    df["source_file"] = up.name
-    dfs.append(df)
+    all_records.extend(recs)
 
-if not dfs:
-    st.error("No se encontraron filas válidas en los archivos.")
+if not all_records:
+    st.error("No se pudo leer ningún registro JSON válido.")
     st.stop()
 
-df_all = pd.concat(dfs, ignore_index=True)
+df = pd.DataFrame(all_records)
+df = normalize_columns(df)
+t = pair_trades(df)
 
-with st.sidebar:
-    st.subheader("⚙️ Ajustes de emparejamiento")
-    fallback_minutes = st.slider("Ventana fallback por tiempo (min)", 5, 180, 45, 5)
+if bad_total > 0:
+    st.caption(f"ℹ️ Líneas inválidas ignoradas al parsear: **{bad_total}**")
 
-    st.subheader("🔥 Rachas")
-    streak_reset_each_day = st.checkbox("Resetear racha por día", value=False)
-    streak_conf_mode = st.selectbox(
-        "Rachas usando…",
-        ["Todos los trades (incluye fallback)", "Solo emparejadas por atmId (alta confianza)"],
-        index=1
-    )
-
-trades = pair_trades(df_all, time_fallback_minutes=fallback_minutes)
-
-# ===== filtros
-st.sidebar.subheader("🎛️ Filtros")
-
-date_min = trades["exit_time"].min()
-date_max = trades["exit_time"].max()
-d1, d2 = st.sidebar.date_input("Rango de fechas (por salida)", value=(date_min.date(), date_max.date()))
-
-mask = (pd.to_datetime(trades["exit_time"]).dt.date >= d1) & (pd.to_datetime(trades["exit_time"]).dt.date <= d2)
-
-lado_opts = sorted(trades["lado"].dropna().unique().tolist())
-lado_sel = st.sidebar.multiselect("Lado", lado_opts, default=lado_opts)
-mask &= trades["lado"].isin(lado_sel)
-
-reason_opts_es = sorted(trades["exitReason_ES"].fillna("").unique().tolist())
-reason_sel = st.sidebar.multiselect("Motivo de salida", reason_opts_es, default=reason_opts_es)
-mask &= trades["exitReason_ES"].fillna("").isin(reason_sel)
-
-t = trades[mask].copy().sort_values("exit_time").reset_index(drop=True)
-
-# recompute equity/drawdown on filtered view
-t["equity"] = t["tradeRealized"].fillna(0).cumsum()
-t["equity_peak"] = t["equity"].cummax()
-t["drawdown"] = t["equity"] - t["equity_peak"]
-
-st.caption(f"🧾 Líneas inválidas ignoradas al parsear: {bad_total}")
-
-strong_count = int(t.get("paired_strong", False).sum()) if "paired_strong" in t.columns else 0
-fallback_count = int(t.get("paired_by_time", False).sum()) if "paired_by_time" in t.columns else 0
-if fallback_count > 0:
-    st.info(f"🧩 Emparejadas por fallback de tiempo: {fallback_count}. (Útil, pero puede afectar rachas/orden).")
-st.caption(f"✅ Emparejadas por atmId (alta confianza): {strong_count}")
-
-if streak_conf_mode.startswith("Solo emparejadas"):
-    t_streak = t[t["paired_strong"] == True].copy().sort_values("exit_time").reset_index(drop=True)
-else:
-    t_streak = t
-
-s = summary_block(t_streak, streak_reset_each_day=streak_reset_each_day)
-
-unknown_dir = int(t["dir"].isna().sum())
-if unknown_dir > 0:
+missing_entry = int((~t["has_entry"]).sum())
+if missing_entry > 0:
     st.warning(
-        f"⚠️ {unknown_dir} operaciones siguen sin dirección (Compra/Venta). "
-        f"WIN/LOSS se calcula por PnL (tradeRealized), no por lado."
+        f"⚠️ **{missing_entry} trades no tienen ENTRY** en los archivos cargados. "
+        "Para esos trades, no podemos saber Compra/Venta y aparecerán como “Sin datos (faltó ENTRY)”."
     )
 
-# ============================
-# Resumen rápido
-# ============================
-st.subheader("✅ Lo más importante (resumen rápido)")
+summary = summarize(t)
+
+# Settings sidebar
+st.sidebar.subheader("⚙️ Ajustes del análisis")
+min_trades = st.sidebar.slider("Mínimo trades por grupo (para considerar confiable)", 5, 80, 30, 5)
+q_bins = st.sidebar.slider("Número de rangos (bins) por cuantiles", 3, 10, 5, 1)
+show_adv_scatter = st.sidebar.checkbox("Mostrar scatters (modo avanzado)", value=False)
+last_n_scatter = st.sidebar.slider("Si scatters: mostrar solo últimos N trades (0=todo)", 0, 2000, 800, 100)
+
+# Summary metrics
+st.subheader("✅ Resumen rápido (lo más importante)")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
-c1.metric("Operaciones", f"{len(t)}")
-c2.metric("Compras (Long)", f"{int((t['dir']==1).sum())}")
-c3.metric("Ventas (Short)", f"{int((t['dir']==-1).sum())}")
-c4.metric("Ganadas", f"{int((t['tradeRealized']>0).sum())}")
-c5.metric("Perdidas", f"{int((t['tradeRealized']<0).sum())}")
-wr = float((t["tradeRealized"] > 0).mean()) if len(t) else np.nan
-c6.metric("% Acierto", f"{(wr*100):.1f}%" if not np.isnan(wr) else "n/a")
-
-pf_all = profit_factor(t)
-exp_all = float(t["tradeRealized"].mean()) if len(t) else np.nan
-max_dd_all = float(t["drawdown"].min()) if len(t) else 0.0
+c1.metric("Operaciones", f"{summary['n']}")
+c2.metric("Ganadas", f"{summary['wins']}")
+c3.metric("Perdidas", f"{summary['losses']}")
+c4.metric("% Acierto", f"{summary['win_rate']:.1f}%")
+c5.metric("PnL Total", f"{summary['pnl_total']:.0f}")
+c6.metric("Profit Factor", f"{summary['pf']:.2f}" if not np.isnan(summary["pf"]) else "N/A")
 
 c7, c8, c9, c10, c11, c12 = st.columns(6)
-c7.metric("PnL Total", f"{float(t['tradeRealized'].sum()):.0f}")
-c8.metric("Profit Factor", f"{pf_all:.2f}" if not np.isnan(pf_all) else "n/a")
-c9.metric("Expectancia", f"{exp_all:.1f}" if not np.isnan(exp_all) else "n/a")
-c10.metric("Max Drawdown", f"{max_dd_all:.0f}")
+c7.metric("Expectancia", f"{summary['expectancy']:.1f}")
+c8.metric("Max Drawdown", f"{summary['max_dd']:.0f}")
+c9.metric("Mejor racha (wins)", f"{summary['best_win_streak']}")
+c10.metric("Peor racha (losses)", f"{summary['best_loss_streak']}")
+c11.metric("Mayor win", f"{summary['max_win']:.1f}")
+c12.metric("Mayor loss", f"{summary['max_loss']:.1f}")
 
-# rachas calculadas según el modo elegido
-label_racha = "Racha (según modo elegido)"
-c11.metric("Mejor racha (wins)", f"{s['best_streak']}")
-c12.metric("Peor racha (losses)", f"{s['worst_streak']}")
-st.caption(f"🔥 Rachas calculadas con: **{streak_conf_mode}** | reset por día: **{streak_reset_each_day}**")
+with st.expander("🧠 Consejos globales (basados en métricas)", expanded=True):
+    pf = summary["pf"]
+    exp = summary["expectancy"]
+    dd = summary["max_dd"]
 
-c13, c14, c15, c16 = st.columns(4)
-c13.metric("Mayor win", f"{float(t['tradeRealized'].max()):.0f}" if len(t) else "0")
-c14.metric("Mayor loss", f"{float(t['tradeRealized'].min()):.0f}" if len(t) else "0")
-avg_win = float(t.loc[t["tradeRealized"] > 0, "tradeRealized"].mean()) if (t["tradeRealized"] > 0).any() else np.nan
-avg_loss = float(t.loc[t["tradeRealized"] < 0, "tradeRealized"].mean()) if (t["tradeRealized"] < 0).any() else np.nan
-c15.metric("Win promedio", f"{avg_win:.1f}" if not np.isnan(avg_win) else "n/a")
-c16.metric("Loss promedio", f"{avg_loss:.1f}" if not np.isnan(avg_loss) else "n/a")
+    if not np.isnan(pf):
+        tag = metric_tag_ok(pf, "high")
+        if pf < 1.0:
+            st.warning(f"{tag} Profit Factor {pf:.2f} → a largo plazo este set tiende a perder. Requiere filtros/ajustes.")
+        elif pf < 1.2:
+            st.info(f"{tag} Profit Factor {pf:.2f} → ligera ventaja, pero frágil. Prioriza control de riesgo y filtros.")
+        else:
+            st.success(f"{tag} Profit Factor {pf:.2f} → ventaja estadística (edge) más sólida en estos datos.")
 
-msgs, warns = interpretacion_rapida({
-    "trades": len(t),
-    "profit_factor": pf_all,
-    "max_drawdown": max_dd_all,
-    "total_pnl": float(t["tradeRealized"].sum()),
-    "worst_streak": s["worst_streak"],
-})
-for m in msgs:
-    st.success(m)
-for w in warns:
-    st.warning(w)
+    if exp < 0:
+        st.warning(f"🔴 Expectancia {exp:.1f} → promedio negativo. Ajusta filtros (OR/ATR/EWO/DeltaRatio) u horarios.")
+    else:
+        st.info(f"🟢 Expectancia {exp:.1f} → promedio positivo. Ahora enfócate en reducir drawdown y rachas.")
 
-# ============================
-# MFE / MAE global
-# ============================
-st.subheader("📌 Extremos intratrade (MFE / MAE)")
+    if not np.isnan(dd) and dd < 0:
+        st.info(f"ℹ️ Max Drawdown {dd:.0f} → úsalo para guardias diarias y sizing. Si duele demasiado, filtra peores grupos.")
 
-if "maxUnreal" in t.columns and t["maxUnreal"].notna().any():
-    idx = t["maxUnreal"].idxmax()
-    row = t.loc[idx]
-    st.metric("Mejor MFE (maxUnreal)", f"{float(row['maxUnreal']):.0f}")
-    st.caption(f"TradeId={row['atmId']} | Salida={row['exit_time']} | Lado={row['lado']}")
+
+# Main charts
+st.subheader("📈 Gráficos principales (claros)")
+
+fig_eq, fig_dd = plot_equity_drawdown(t)
+colA, colB = st.columns(2)
+with colA:
+    st.plotly_chart(fig_eq, use_container_width=True)
+with colB:
+    st.plotly_chart(fig_dd, use_container_width=True)
+
+st.plotly_chart(plot_pnl_hist(t), use_container_width=True)
+
+# Side summary
+st.subheader("🧭 Compra vs Venta (solo donde hay ENTRY)")
+col1, col2, col3 = st.columns(3)
+col1.metric("Compras (Long)", int((t["lado"] == "Compra (Long)").sum()))
+col2.metric("Ventas (Short)", int((t["lado"] == "Venta (Short)").sum()))
+col3.metric("Sin datos (faltó ENTRY)", int((t["lado"].str.startswith("Sin datos")).sum()))
+
+known = t[t["lado"].isin(["Compra (Long)", "Venta (Short)"])].copy()
+if known.empty:
+    st.info("No hay suficientes trades con ENTRY para separar Compra/Venta. (Se arregla logueando dir en EXIT).")
 else:
-    st.info("No hay maxUnreal en los logs.")
+    side_tbl = group_metrics(known, "lado", min_trades=max(5, min_trades // 2))
+    st.dataframe(side_tbl, use_container_width=True)
+    advice_from_table(side_tbl, "Compra/Venta", max(5, min_trades // 2))
 
-if "minUnreal" in t.columns and t["minUnreal"].notna().any():
-    idx = t["minUnreal"].idxmin()
-    row = t.loc[idx]
-    st.metric("Peor MAE (minUnreal)", f"{float(row['minUnreal']):.0f}")
-    st.caption(f"TradeId={row['atmId']} | Salida={row['exit_time']} | Lado={row['lado']}")
+
+# ============================================================
+# Tuning: ORSize / ATR / EWO / DeltaRatio
+# ============================================================
+st.subheader("🛠️ Ajuste de filtros (lo que realmente sirve para tunear)")
+
+if known.empty:
+    st.info("Estos análisis necesitan ENTRY (para tener ORSize/ATR/EWO/DeltaRatio por trade).")
 else:
-    st.info("No hay minUnreal en los logs.")
+    # Reduce ruido si user quiere
+    df_known = known.copy()
+    if last_n_scatter and last_n_scatter > 0:
+        df_known = df_known.sort_values("exit_time").tail(last_n_scatter)
 
-# ============================
-# Por lado
-# ============================
-st.subheader("🧭 Rendimiento por lado (Compra vs Venta)")
-sb = side_breakdown(t, streak_reset_each_day=streak_reset_each_day)
-sb2 = sb.copy()
-sb2["win_rate"] = (sb2["win_rate"] * 100).round(1)
-sb2.rename(columns={
-    "lado":"Lado",
-    "trades":"Trades",
-    "wins":"Wins",
-    "losses":"Losses",
-    "win_rate":"WinRate(%)",
-    "total_pnl":"PnL Total",
-    "avg_pnl":"PnL Prom",
-    "profit_factor":"PF",
-    "max_win":"Max Win",
-    "max_loss":"Max Loss",
-    "racha_ganadora_max":"Racha Win Max",
-    "racha_perdedora_max":"Racha Loss Max",
-}, inplace=True)
-st.dataframe(sb2, use_container_width=True, height=260)
+    tab1, tab2, tab3, tab4 = st.tabs(["OR Size", "ATR", "EWO", "DeltaRatio"])
 
-# ============================
-# Motivos de salida
-# ============================
-st.subheader("🚪 Motivos de salida (impacto)")
-by_exit = (t.groupby("exitReason_ES", dropna=False)
-             .agg(
-                 trades=("atmId","count"),
-                 win_rate=("tradeRealized", lambda x: float((x>0).mean()) if len(x) else np.nan),
-                 avg_pnl=("tradeRealized","mean"),
-                 total_pnl=("tradeRealized","sum"),
-             )
-             .reset_index()
-             .sort_values("trades", ascending=False))
-by_exit["win_rate"] = (by_exit["win_rate"] * 100).round(1)
-by_exit.rename(columns={
-    "exitReason_ES":"Motivo",
-    "trades":"Trades",
-    "win_rate":"WinRate(%)",
-    "avg_pnl":"PnL Prom",
-    "total_pnl":"PnL Total",
-}, inplace=True)
-st.dataframe(by_exit, use_container_width=True, height=300)
+    with tab1:
+        if "orSize" in known.columns and known["orSize"].notna().sum() > 30:
+            plot_factor_bins(known, "orSize", q_bins, min_trades, "OR Size")
+            if show_adv_scatter:
+                plot_scatter_advanced(df_known, "orSize", "OR Size vs PnL")
+        else:
+            st.info("No hay suficientes valores de OR Size en los logs.")
 
-# ============================
-# Gráficos
-# ============================
-st.subheader("📈 Gráficos")
+    with tab2:
+        if "atr" in known.columns and known["atr"].notna().sum() > 30:
+            plot_factor_bins(known, "atr", q_bins, min_trades, "ATR")
+            if show_adv_scatter:
+                plot_scatter_advanced(df_known, "atr", "ATR vs PnL")
+        else:
+            st.info("No hay suficientes valores de ATR en los logs.")
 
-g1, g2 = st.columns(2)
-with g1:
-    st.markdown("### Curva de capital (Equity)")
-    st.caption("PnL acumulado operación por operación.")
-    st.line_chart(t.set_index("exit_time")["equity"])
+    with tab3:
+        if "ewo" in known.columns and known["ewo"].notna().sum() > 30:
+            # usamos magnitud abs(ewo) porque suele ser lo útil
+            known2 = known.copy()
+            known2["ewo_abs"] = known2["ewo"].abs()
+            plot_factor_bins(known2, "ewo_abs", q_bins, min_trades, "EWO (magnitud |abs|)")
+            if show_adv_scatter:
+                plot_scatter_advanced(df_known.assign(ewo_abs=df_known["ewo"].abs()), "ewo_abs", "EWO |abs| vs PnL")
+        else:
+            st.info("No hay suficientes valores de EWO en los logs.")
 
-with g2:
-    st.markdown("### Drawdown (caída desde máximos)")
-    st.caption("Caída desde el último máximo de equity. Más bajo = peor.")
-    st.line_chart(t.set_index("exit_time")["drawdown"])
+    with tab4:
+        if "deltaRatio" in known.columns and known["deltaRatio"].notna().sum() > 30:
+            plot_factor_bins(known, "deltaRatio", q_bins, min_trades, "DeltaRatio")
+            if show_adv_scatter:
+                plot_scatter_advanced(df_known, "deltaRatio", "DeltaRatio vs PnL")
+        else:
+            st.info("No hay suficientes valores de DeltaRatio en los logs.")
 
-# ===== Distribución + percentiles
-st.markdown("### Distribución de PnL por trade + percentiles")
-if len(t) > 0:
-    pnls = t["tradeRealized"].dropna()
-    if len(pnls) > 0:
-        p10, p25, p50, p75, p90 = np.percentile(pnls, [10,25,50,75,90])
 
-        hist = alt.Chart(t.dropna(subset=["tradeRealized"])).mark_bar().encode(
-            x=alt.X("tradeRealized:Q", bin=alt.Bin(maxbins=60), title="PnL por trade"),
-            y=alt.Y("count():Q", title="Cantidad")
-        ).properties(height=280)
+# ============================================================
+# Time analysis (fair): Hour + Heatmap weekday/hour
+# ============================================================
+st.subheader("⏰ Horarios (justo y confiable)")
 
-        lines = pd.DataFrame({
-            "x": [p10,p25,p50,p75,p90],
-            "label": ["P10","P25","P50","P75","P90"]
-        })
-        vlines = alt.Chart(lines).mark_rule().encode(
-            x="x:Q",
-            tooltip=["label","x"]
-        )
-        st.altair_chart(hist + vlines, use_container_width=True)
-        st.caption(f"Percentiles: P10={p10:.0f} | P25={p25:.0f} | P50={p50:.0f} | P75={p75:.0f} | P90={p90:.0f}")
+plot_hour_analysis(t, min_trades=min_trades)
+plot_heatmap_weekday_hour(t, min_trades=min_trades)
 
-# ===== CDF / curva percentil
-st.markdown("### Curva de percentiles (CDF)")
-if len(t) > 0 and t["tradeRealized"].notna().any():
-    pnls = np.sort(t["tradeRealized"].dropna().values)
-    y = np.linspace(0, 100, len(pnls))
-    df_cdf = pd.DataFrame({"PnL": pnls, "Percentil": y})
-    cdf = alt.Chart(df_cdf).mark_line().encode(
-        x=alt.X("PnL:Q", title="PnL"),
-        y=alt.Y("Percentil:Q", title="Percentil (%)")
-    ).properties(height=280)
-    st.altair_chart(cdf, use_container_width=True)
+with st.expander("📄 Tabla de trades (una fila por atmId)", expanded=False):
+    cols_show = [c for c in [
+        "exit_time", "entry_time", "lado", "outcome", "tradeRealized",
+        "maxUnreal", "minUnreal", "exitReason", "forcedCloseReason",
+        "orSize", "ewo", "atr", "deltaRatio", "atrSlMult", "tp1R", "tp2R"
+    ] if c in t.columns]
+    st.dataframe(t[cols_show].sort_values("exit_time", ascending=False), use_container_width=True)
 
-# ===== Hora del día
-st.markdown("### Rendimiento por hora")
-by_hour = (t.groupby("exit_hour")
-            .agg(
-                trades=("atmId","count"),
-                win_rate=("tradeRealized", lambda x: float((x>0).mean()) if len(x) else np.nan),
-                avg_pnl=("tradeRealized","mean"),
-                total_pnl=("tradeRealized","sum"),
-            )
-            .reset_index()
-            .sort_values("exit_hour"))
-by_hour["win_rate_pct"] = (by_hour["win_rate"] * 100).round(1)
-
-cA, cB = st.columns(2)
-with cA:
-    ch = alt.Chart(by_hour).mark_bar().encode(
-        x=alt.X("exit_hour:O", title="Hora"),
-        y=alt.Y("win_rate_pct:Q", title="WinRate (%)"),
-        tooltip=["exit_hour","trades","win_rate_pct","avg_pnl","total_pnl"]
-    ).properties(height=260)
-    st.altair_chart(ch, use_container_width=True)
-with cB:
-    ch2 = alt.Chart(by_hour).mark_bar().encode(
-        x=alt.X("exit_hour:O", title="Hora"),
-        y=alt.Y("avg_pnl:Q", title="PnL promedio"),
-        tooltip=["exit_hour","trades","win_rate_pct","avg_pnl","total_pnl"]
-    ).properties(height=260)
-    st.altair_chart(ch2, use_container_width=True)
-
-# ===== Scatters útiles para tuning
-st.markdown("### Scatters útiles para tuning (PnL vs factores)")
-def scatter_if(col, title):
-    if col in t.columns and t[col].notna().any():
-        dfp = t.dropna(subset=[col, "tradeRealized"])
-        chart = alt.Chart(dfp).mark_circle(size=60, opacity=0.45).encode(
-            x=alt.X(f"{col}:Q", title=title),
-            y=alt.Y("tradeRealized:Q", title="PnL"),
-            tooltip=["exit_time","lado","tradeRealized",col]
-        ).properties(height=260)
-        st.altair_chart(chart, use_container_width=True)
-
-s1, s2 = st.columns(2)
-with s1:
-    scatter_if("orSize", "OR Size")
-    scatter_if("atr", "ATR")
-with s2:
-    scatter_if("ewo", "EWO")
-    scatter_if("deltaRatio", "DeltaRatio")
-
-# ============================
-# Tabla trades
-# ============================
-st.subheader("📋 Lista de operaciones (vista humana)")
-
-cols = []
-for c in [
-    "atmId","lado","paired_strong","paired_by_time","entry_time","exit_time","dur_min",
-    "tradeRealized","outcome","exitReason_ES","forcedCloseReason",
-    "trigger","orHigh","orLow","orSize","atr","ewo","deltaRatio",
-    "maxUnreal","minUnreal","source_file"
-]:
-    if c in t.columns:
-        cols.append(c)
-
-t_view = t[cols].copy()
-t_view.rename(columns={
-    "atmId":"TradeId",
-    "lado":"Lado",
-    "paired_strong":"Emparejada por atmId",
-    "paired_by_time":"Emparejada por tiempo",
-    "entry_time":"Entrada",
-    "exit_time":"Salida",
-    "dur_min":"Duración (min)",
-    "tradeRealized":"PnL",
-    "outcome":"Resultado",
-    "exitReason_ES":"Motivo salida",
-    "forcedCloseReason":"Motivo forzado",
-    "trigger":"Trigger",
-    "orHigh":"OR High",
-    "orLow":"OR Low",
-    "orSize":"OR Size",
-    "atr":"ATR",
-    "ewo":"EWO",
-    "deltaRatio":"DeltaRatio",
-    "maxUnreal":"MFE (maxUnreal)",
-    "minUnreal":"MAE (minUnreal)",
-    "source_file":"Archivo",
-}, inplace=True)
-
-st.dataframe(t_view, use_container_width=True, height=520)
-
-# ============================
-# Export
-# ============================
-st.subheader("⬇️ Exportar")
-csv_bytes = t_view.to_csv(index=False).encode("utf-8")
-st.download_button(
-    "Descargar CSV (operaciones filtradas)",
-    data=csv_bytes,
-    file_name="WIC_WLF2_operaciones_filtradas.csv",
-    mime="text/csv",
+st.caption(
+    "Tip: para eliminar totalmente “Sin datos (faltó ENTRY)”, lo ideal es que el NinjaScript escriba `dir` también dentro del `EXIT`."
 )
