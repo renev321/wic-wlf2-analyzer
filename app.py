@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import json
 import plotly.express as px
-import plotly.graph_objects as go
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
@@ -17,7 +16,6 @@ if APP_PASSWORD:
     if pwd != APP_PASSWORD:
         st.sidebar.warning("Contraseña incorrecta.")
         st.stop()
-
 
 # ============================================================
 # Helpers
@@ -45,16 +43,6 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
         df["ts_parsed"] = pd.to_datetime(df["timestamp"], errors="coerce")
     else:
         df["ts_parsed"] = pd.NaT
-
-    # Compat keys (por si logs viejos cambiaron nombres)
-    rename_map = {
-        "slAtrMult": "atrSlMult",
-        "tpR": "tp1R",
-        "useAtrOverride": "useAtrEngine",
-    }
-    for old, new in rename_map.items():
-        if old in df.columns and new not in df.columns:
-            df[new] = df[old]
 
     if "type" not in df.columns:
         df["type"] = ""
@@ -97,6 +85,14 @@ def drawdown_details(t: pd.DataFrame):
     peak_idx = int(t.loc[:trough_idx, "equity"].idxmax())
     peak_time = t.loc[peak_idx, "exit_time"]
     return float(dd.min()), peak_time, trough_time
+
+
+def hour_bucket_label(h):
+    """14 -> '14:00–14:59' """
+    if pd.isna(h):
+        return "Sin hora"
+    h = int(h)
+    return f"{h:02d}:00–{h:02d}:59"
 
 
 def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
@@ -155,8 +151,8 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
 
     t["has_entry"] = t.get("entry_time", pd.NaT).notna()
 
-    # outcome robusto
-    calc_outcome = pd.Series(np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS"), index=t.index)
+    # outcome robusto (si falta 'outcome' en EXIT, lo calculamos por PnL)
+    calc_outcome = np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS")
     if "outcome" not in t.columns:
         t["outcome"] = calc_outcome
     else:
@@ -168,7 +164,6 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
     else:
         t["duration_sec"] = np.nan
 
-    # sort
     t = t.sort_values("exit_time").reset_index(drop=True)
 
     # equity & drawdown
@@ -179,9 +174,12 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
     # time buckets
     t["exit_date"] = pd.to_datetime(t["exit_time"]).dt.date
     t["exit_hour"] = pd.to_datetime(t["exit_time"]).dt.hour
+    t["exit_hour_label"] = t["exit_hour"].apply(hour_bucket_label)
+
+    # weekday
     t["weekday"] = pd.to_datetime(t["exit_time"]).dt.day_name()
 
-    # side
+    # side (Compra/Venta)
     def side_label(x):
         if pd.isna(x):
             return "Sin datos (faltó ENTRY)"
@@ -215,8 +213,8 @@ def summarize(t: pd.DataFrame) -> dict:
     max_win = float(t["tradeRealized"].max())
     max_loss = float(t["tradeRealized"].min())
 
-    wlen, ws, we = max_streak(t["outcome"], "WIN")
-    llen, ls, le = max_streak(t["outcome"], "LOSS")
+    wlen, _, _ = max_streak(pd.Series(np.where(t["tradeRealized"] >= 0, "WIN", "LOSS")), "WIN")
+    llen, _, _ = max_streak(pd.Series(np.where(t["tradeRealized"] >= 0, "WIN", "LOSS")), "LOSS")
 
     return {
         "n": n, "wins": wins, "losses": losses, "win_rate": win_rate,
@@ -225,28 +223,15 @@ def summarize(t: pd.DataFrame) -> dict:
         "max_dd": max_dd, "dd_peak_time": dd_peak_time, "dd_trough_time": dd_trough_time,
         "max_win": max_win, "max_loss": max_loss,
         "best_win_streak": wlen, "best_loss_streak": llen,
-        "best_win_streak_idx": (ws, we),
-        "best_loss_streak_idx": (ls, le),
     }
-
-
-def metric_tag_ok(value, good_when="high"):
-    # Pequeña ayuda visual para consejos
-    if value is None or (isinstance(value, float) and (np.isnan(value) or np.isinf(value))):
-        return "⚪"
-    if good_when == "high":
-        return "🟢" if value >= 1.2 else ("🟡" if value >= 1.0 else "🔴")
-    else:
-        return "🟢" if value <= -500 else ("🟡" if value <= -300 else "🔴")
 
 
 def make_bins_quantiles(df: pd.DataFrame, col: str, q: int):
     s = df[col].dropna()
     if len(s) < q * 10:
-        return None  # poca data
+        return None
     try:
-        bins = pd.qcut(df[col], q=q, duplicates="drop")
-        return bins
+        return pd.qcut(df[col], q=q, duplicates="drop")
     except Exception:
         return None
 
@@ -259,19 +244,18 @@ def group_metrics(df: pd.DataFrame, group_col: str, min_trades: int):
             continue
         wins = int((sub["tradeRealized"] > 0).sum())
         wr = wins / n * 100
-        wr_adj = (wins + 1) / (n + 2) * 100  # smoothing (evita 2 trades=100% “perfecto”)
+        wr_adj = (wins + 1) / (n + 2) * 100  # suavizado: evita 2 trades = 100% “perfecto”
         pf = profit_factor(sub)
         exp = float(sub["tradeRealized"].mean())
         pnl = float(sub["tradeRealized"].sum())
-        # Score ponderado: prioriza exp + tamaño de muestra
-        score = exp * np.log1p(n)
+        score = exp * np.log1p(n)  # pondera por tamaño de muestra
         rows.append({
             "Grupo": str(g),
             "Trades": n,
             "WinRate%": wr,
             "WinRate Ajustado%": wr_adj,
-            "PF": pf,
-            "Expectancia": exp,
+            "Profit Factor": pf,
+            "Promedio por trade": exp,
             "PnL Total": pnl,
             "Score (ponderado)": score,
         })
@@ -289,30 +273,29 @@ def advice_from_table(tbl: pd.DataFrame, title: str, min_trades: int):
     best = tbl.iloc[0]
     worst = tbl.iloc[-1]
 
-    st.markdown("**Consejos automáticos (basados en los datos):**")
+    st.markdown("**✅ Consejos automáticos (basados en datos):**")
     st.write(
-        f"✅ Mejor grupo: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
-        f"PF={best['PF']:.2f} | Exp={best['Expectancia']:.1f} | PnL={best['PnL Total']:.0f}"
+        f"🏆 Mejor grupo: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
+        f"PF={best['Profit Factor']:.2f} | Promedio/trade={best['Promedio por trade']:.1f} | PnL={best['PnL Total']:.0f}"
     )
     st.write(
-        f"⚠️ Peor grupo: **{worst['Grupo']}** | Trades={int(worst['Trades'])} | "
-        f"PF={worst['PF']:.2f} | Exp={worst['Expectancia']:.1f} | PnL={worst['PnL Total']:.0f}"
+        f"🧨 Peor grupo: **{worst['Grupo']}** | Trades={int(worst['Trades'])} | "
+        f"PF={worst['Profit Factor']:.2f} | Promedio/trade={worst['Promedio por trade']:.1f} | PnL={worst['PnL Total']:.0f}"
     )
 
-    # Reglas simples para texto
-    if not np.isnan(best["PF"]) and best["PF"] < 1.0:
-        st.warning("⚠️ Incluso el “mejor” grupo tiene PF < 1.0 → faltan filtros o el sistema no tiene edge con estos datos.")
-    if not np.isnan(worst["PF"]) and worst["PF"] < 1.0:
-        st.warning("🧨 Hay grupos con PF < 1.0 → considera filtrarlos o ajustar SL/TP/horarios.")
+    if not np.isnan(best["Profit Factor"]) and best["Profit Factor"] < 1.0:
+        st.warning("⚠️ Incluso el “mejor” grupo tiene PF < 1.0 → faltan filtros o el sistema no tiene ventaja en estos datos.")
+    if not np.isnan(worst["Profit Factor"]) and worst["Profit Factor"] < 1.0:
+        st.warning("👉 Hay grupos con PF < 1.0 → considera filtrarlos (o ajustar SL/TP/horarios).")
     if best["Trades"] < min_trades * 2:
-        st.info("ℹ️ El mejor grupo tiene muestra justa. Ideal: acumular más trades para confirmar.")
+        st.info("ℹ️ Muestra justa: el mejor grupo tiene pocos trades. Ideal: más datos para confirmarlo.")
 
 
 def plot_equity_drawdown(t: pd.DataFrame):
-    fig1 = px.line(t, x="exit_time", y="equity", title="Equity (curva de capital)")
+    fig1 = px.line(t, x="exit_time", y="equity", title="Equity (curva de capital acumulada)")
     fig1.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
 
-    fig2 = px.line(t, x="exit_time", y="drawdown", title="Drawdown (caída desde el pico)")
+    fig2 = px.line(t, x="exit_time", y="drawdown", title="Drawdown (caída desde el máximo de equity)")
     fig2.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10))
     fig2.add_hline(y=0, line_width=1, line_dash="dash")
 
@@ -320,7 +303,7 @@ def plot_equity_drawdown(t: pd.DataFrame):
 
 
 def plot_pnl_hist(t: pd.DataFrame):
-    fig = px.histogram(t, x="tradeRealized", nbins=40, title="Distribución de PnL por trade")
+    fig = px.histogram(t, x="tradeRealized", nbins=40, title="Distribución de PnL por operación")
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
     fig.add_vline(x=0, line_width=1, line_dash="dash")
     return fig
@@ -340,12 +323,11 @@ def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, 
         st.info(f"En **{title}** no hay bins con mínimo {min_trades} trades.")
         return
 
-    # Gráficos
-    fig_exp = px.bar(tbl, x="Grupo", y="Expectancia", title=f"{title} → Expectancia por rango (bins)")
+    fig_exp = px.bar(tbl, x="Grupo", y="Promedio por trade", title=f"{title} → Promedio por trade (bins)")
     fig_exp.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
     fig_exp.add_hline(y=0, line_width=1, line_dash="dash")
 
-    fig_pf = px.bar(tbl, x="Grupo", y="PF", title=f"{title} → Profit Factor por rango (bins)")
+    fig_pf = px.bar(tbl, x="Grupo", y="Profit Factor", title=f"{title} → Profit Factor (bins)")
     fig_pf.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
     fig_pf.add_hline(y=1.0, line_width=1, line_dash="dash")
 
@@ -357,7 +339,6 @@ def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, 
 
 
 def plot_scatter_advanced(df_known: pd.DataFrame, xcol: str, title: str):
-    # Scatter más legible: verde arriba de 0, rojo abajo
     tmp = df_known[[xcol, "tradeRealized", "exit_time", "lado", "exitReason"]].dropna().copy()
     tmp["Resultado"] = np.where(tmp["tradeRealized"] >= 0, "Ganancia", "Pérdida")
 
@@ -375,58 +356,55 @@ def plot_scatter_advanced(df_known: pd.DataFrame, xcol: str, title: str):
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.caption("Cómo leerlo: si en cierto rango de X hay mayoría de puntos verdes y pocos rojos grandes → ese rango suele ser mejor.")
+    st.caption("Cómo leerlo: busca zonas con más verde y con rojos pequeños. Si ves rojos enormes en un rango → ese rango suele ser peligroso.")
 
 
 def plot_hour_analysis(t: pd.DataFrame, min_trades: int):
-    # Tabla por hora: usa winrate ajustado + score ponderado (evita 2 trades = 100% engañoso)
-    tbl = group_metrics(t, "exit_hour", min_trades=min_trades)
+    tbl = group_metrics(t, "exit_hour_label", min_trades=min_trades)
     if tbl.empty:
         st.info(f"No hay suficientes trades por hora para min_trades={min_trades}.")
         return
 
-    fig = px.bar(tbl, x="Grupo", y="Score (ponderado)", title="Horas con mejor score (ponderado por muestra)")
+    fig = px.bar(tbl, x="Grupo", y="Score (ponderado)",
+                 title="Horas más prometedoras (Score ponderado por tamaño de muestra)")
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
     st.dataframe(tbl, use_container_width=True)
-    advice_from_table(tbl, title="Hora de salida (exit_hour)", min_trades=min_trades)
+    advice_from_table(tbl, title="Hora (bucket)", min_trades=min_trades)
 
 
 def plot_heatmap_weekday_hour(t: pd.DataFrame, min_trades: int):
-    # Heatmap de Expectancia por weekday x hour, pero oculta celdas con pocos trades
     tmp = t.copy()
-    tmp["weekday_order"] = pd.Categorical(
-        tmp["weekday"],
-        categories=["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
-        ordered=True
-    )
+
+    weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+    tmp["weekday_order"] = pd.Categorical(tmp["weekday"], categories=weekday_order, ordered=True)
 
     agg = tmp.groupby(["weekday_order", "exit_hour"]).agg(
         Trades=("tradeRealized", "size"),
-        Expectancia=("tradeRealized", "mean"),
-        PnL=("tradeRealized", "sum"),
+        Promedio=("tradeRealized", "mean"),
     ).reset_index()
 
-    agg.loc[agg["Trades"] < min_trades, "Expectancia"] = np.nan
+    # ocultar celdas con poca muestra
+    agg.loc[agg["Trades"] < min_trades, "Promedio"] = np.nan
 
-    pivot = agg.pivot(index="weekday_order", columns="exit_hour", values="Expectancia")
+    pivot = agg.pivot(index="weekday_order", columns="exit_hour", values="Promedio")
     fig = px.imshow(
         pivot,
         aspect="auto",
-        title=f"Heatmap: Expectancia por Día x Hora (solo celdas con ≥ {min_trades} trades)",
+        title=f"Heatmap: Promedio por trade (Día x Hora) | solo celdas con ≥ {min_trades} trades",
         origin="lower"
     )
     fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
-    st.caption("Cómo leerlo: celdas más altas (más positivas) = mejores combinaciones Día/Hora. Celdas vacías = poca muestra.")
+    st.caption("Cómo leerlo: celdas más positivas = mejor promedio/trade. Celdas vacías = poca muestra (no concluyente).")
 
 
 # ============================================================
 # UI
 # ============================================================
-st.title("📊 WIC_WLF2 Analizador (Plotly)")
+st.title("📊 WIC_WLF2 Analizador (Plotly, Español, UI/UX simple)")
 
 uploaded = st.file_uploader(
     "📤 Sube uno o varios archivos .jsonl (meses)",
@@ -458,20 +436,23 @@ if bad_total > 0:
 missing_entry = int((~t["has_entry"]).sum())
 if missing_entry > 0:
     st.warning(
-        f"⚠️ **{missing_entry} trades no tienen ENTRY** en los archivos cargados. "
-        "Para esos trades, no podemos saber Compra/Venta y aparecerán como “Sin datos (faltó ENTRY)”."
+        f"⚠️ **{missing_entry} operaciones no tienen ENTRY** en los archivos cargados. "
+        "En esas, no se puede saber Compra/Venta ni ORSize/ATR/EWO/DeltaRatio. "
+        "Se muestran como: “Sin datos (faltó ENTRY)”."
     )
+
+# Sidebar
+st.sidebar.subheader("⚙️ Ajustes")
+min_trades = st.sidebar.slider("Mínimo trades por grupo (confiable)", 5, 80, 30, 5)
+q_bins = st.sidebar.slider("Número de rangos (bins por cuantiles)", 3, 10, 5, 1)
+show_adv_scatter = st.sidebar.checkbox("Mostrar scatters (modo avanzado)", value=False)
+last_n_scatter = st.sidebar.slider("Scatters: últimos N trades (0=todo)", 0, 2000, 800, 100)
 
 summary = summarize(t)
 
-# Settings sidebar
-st.sidebar.subheader("⚙️ Ajustes del análisis")
-min_trades = st.sidebar.slider("Mínimo trades por grupo (para considerar confiable)", 5, 80, 30, 5)
-q_bins = st.sidebar.slider("Número de rangos (bins) por cuantiles", 3, 10, 5, 1)
-show_adv_scatter = st.sidebar.checkbox("Mostrar scatters (modo avanzado)", value=False)
-last_n_scatter = st.sidebar.slider("Si scatters: mostrar solo últimos N trades (0=todo)", 0, 2000, 800, 100)
-
-# Summary metrics
+# ============================================================
+# Resumen
+# ============================================================
 st.subheader("✅ Resumen rápido (lo más importante)")
 
 c1, c2, c3, c4, c5, c6 = st.columns(6)
@@ -483,37 +464,22 @@ c5.metric("PnL Total", f"{summary['pnl_total']:.0f}")
 c6.metric("Profit Factor", f"{summary['pf']:.2f}" if not np.isnan(summary["pf"]) else "N/A")
 
 c7, c8, c9, c10, c11, c12 = st.columns(6)
-c7.metric("Expectancia", f"{summary['expectancy']:.1f}")
+c7.metric("Promedio por trade (Expectancia)", f"{summary['expectancy']:.1f}")
 c8.metric("Max Drawdown", f"{summary['max_dd']:.0f}")
-c9.metric("Mejor racha (wins)", f"{summary['best_win_streak']}")
-c10.metric("Peor racha (losses)", f"{summary['best_loss_streak']}")
+c9.metric("Mejor racha (wins seguidos)", f"{summary['best_win_streak']}")
+c10.metric("Peor racha (losses seguidos)", f"{summary['best_loss_streak']}")
 c11.metric("Mayor win", f"{summary['max_win']:.1f}")
 c12.metric("Mayor loss", f"{summary['max_loss']:.1f}")
 
-with st.expander("🧠 Consejos globales (basados en métricas)", expanded=True):
-    pf = summary["pf"]
-    exp = summary["expectancy"]
-    dd = summary["max_dd"]
+with st.expander("📌 Cómo leer estas métricas (simple)", expanded=False):
+    st.write("**Promedio por trade (Expectancia)**: lo que ganas/pierdes en promedio por operación. Si es positivo, bien.")
+    st.write("**Profit Factor**: ganancias totales / pérdidas totales. PF > 1.0 indica ventaja. PF > 1.2 suele ser más sólido.")
+    st.write("**Drawdown**: la peor caída desde el máximo de tu equity; representa el “dolor máximo” del sistema.")
+    st.write("**Rachas**: cuántas operaciones ganadas/perdidas seguidas (útil para guardias diarias y sizing).")
 
-    if not np.isnan(pf):
-        tag = metric_tag_ok(pf, "high")
-        if pf < 1.0:
-            st.warning(f"{tag} Profit Factor {pf:.2f} → a largo plazo este set tiende a perder. Requiere filtros/ajustes.")
-        elif pf < 1.2:
-            st.info(f"{tag} Profit Factor {pf:.2f} → ligera ventaja, pero frágil. Prioriza control de riesgo y filtros.")
-        else:
-            st.success(f"{tag} Profit Factor {pf:.2f} → ventaja estadística (edge) más sólida en estos datos.")
-
-    if exp < 0:
-        st.warning(f"🔴 Expectancia {exp:.1f} → promedio negativo. Ajusta filtros (OR/ATR/EWO/DeltaRatio) u horarios.")
-    else:
-        st.info(f"🟢 Expectancia {exp:.1f} → promedio positivo. Ahora enfócate en reducir drawdown y rachas.")
-
-    if not np.isnan(dd) and dd < 0:
-        st.info(f"ℹ️ Max Drawdown {dd:.0f} → úsalo para guardias diarias y sizing. Si duele demasiado, filtra peores grupos.")
-
-
-# Main charts
+# ============================================================
+# Charts principales
+# ============================================================
 st.subheader("📈 Gráficos principales (claros)")
 
 fig_eq, fig_dd = plot_equity_drawdown(t)
@@ -525,8 +491,16 @@ with colB:
 
 st.plotly_chart(plot_pnl_hist(t), use_container_width=True)
 
-# Side summary
+# ============================================================
+# Compra vs Venta
+# ============================================================
 st.subheader("🧭 Compra vs Venta (solo donde hay ENTRY)")
+
+st.write(
+    "📌 Si ves muchas operaciones como “Sin datos (faltó ENTRY)”, significa que en esos trades el JSON solo tiene EXIT "
+    "o no está en el mismo archivo el ENTRY. No vamos a inventar Compra/Venta."
+)
+
 col1, col2, col3 = st.columns(3)
 col1.metric("Compras (Long)", int((t["lado"] == "Compra (Long)").sum()))
 col2.metric("Ventas (Short)", int((t["lado"] == "Venta (Short)").sum()))
@@ -534,22 +508,20 @@ col3.metric("Sin datos (faltó ENTRY)", int((t["lado"].str.startswith("Sin datos
 
 known = t[t["lado"].isin(["Compra (Long)", "Venta (Short)"])].copy()
 if known.empty:
-    st.info("No hay suficientes trades con ENTRY para separar Compra/Venta. (Se arregla logueando dir en EXIT).")
+    st.info("No hay suficientes trades con ENTRY para separar Compra/Venta.")
 else:
     side_tbl = group_metrics(known, "lado", min_trades=max(5, min_trades // 2))
     st.dataframe(side_tbl, use_container_width=True)
     advice_from_table(side_tbl, "Compra/Venta", max(5, min_trades // 2))
 
-
 # ============================================================
-# Tuning: ORSize / ATR / EWO / DeltaRatio
+# Tuning por factores
 # ============================================================
-st.subheader("🛠️ Ajuste de filtros (lo que realmente sirve para tunear)")
+st.subheader("🛠️ Ajuste de filtros (lo más útil para tunear)")
 
 if known.empty:
     st.info("Estos análisis necesitan ENTRY (para tener ORSize/ATR/EWO/DeltaRatio por trade).")
 else:
-    # Reduce ruido si user quiere
     df_known = known.copy()
     if last_n_scatter and last_n_scatter > 0:
         df_known = df_known.sort_values("exit_time").tail(last_n_scatter)
@@ -574,7 +546,6 @@ else:
 
     with tab3:
         if "ewo" in known.columns and known["ewo"].notna().sum() > 30:
-            # usamos magnitud abs(ewo) porque suele ser lo útil
             known2 = known.copy()
             known2["ewo_abs"] = known2["ewo"].abs()
             plot_factor_bins(known2, "ewo_abs", q_bins, min_trades, "EWO (magnitud |abs|)")
@@ -591,9 +562,8 @@ else:
         else:
             st.info("No hay suficientes valores de DeltaRatio en los logs.")
 
-
 # ============================================================
-# Time analysis (fair): Hour + Heatmap weekday/hour
+# Horarios (arreglado)
 # ============================================================
 st.subheader("⏰ Horarios (justo y confiable)")
 
@@ -609,5 +579,6 @@ with st.expander("📄 Tabla de trades (una fila por atmId)", expanded=False):
     st.dataframe(t[cols_show].sort_values("exit_time", ascending=False), use_container_width=True)
 
 st.caption(
-    "Tip: para eliminar totalmente “Sin datos (faltó ENTRY)”, lo ideal es que el NinjaScript escriba `dir` también dentro del `EXIT`."
+    "Tip: para eliminar completamente “Sin datos (faltó ENTRY)”, lo ideal es incluir `dir` también dentro del EXIT "
+    "o asegurar que los archivos cargados incluyen ENTRY+EXIT del mismo período."
 )
