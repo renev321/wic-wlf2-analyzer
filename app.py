@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="WIC_WLF2 Analizador JSONL", layout="wide")
+st.set_page_config(page_title="WIC_WLF2", layout="wide")
 
 # ============================
 # Seguridad opcional (password)
