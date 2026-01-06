@@ -100,10 +100,20 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
     t["has_entry"] = t["entry_time"].notna()
     t["duration_sec"] = (t["exit_time"] - t["entry_time"]).dt.total_seconds()
 
+    # fill outcome if missing (pandas-safe: no ndarray passed to fillna)
+    default_outcome = pd.Series(
+        np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS"),
+        index=t.index
+    )
+    
     if "outcome" not in t.columns:
-        t["outcome"] = np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS")
+        t["outcome"] = default_outcome
     else:
-        t["outcome"] = t["outcome"].fillna(np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS"))
+        # ensure missing values are real NaNs/<NA>, then fill only where missing
+        t["outcome"] = t["outcome"].astype("string")
+        missing = t["outcome"].isna()
+        t.loc[missing, "outcome"] = default_outcome.loc[missing]
+
 
     t["exitReason"] = t.get("exitReason", "").fillna("")
     t["forcedCloseReason"] = t.get("forcedCloseReason", "").fillna("")
