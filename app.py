@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="WIC_WLF2", layout="wide")
+st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
 # ============================
 # Seguridad opcional (password)
@@ -33,7 +33,7 @@ def auth_gate():
 auth_gate()
 
 # ============================
-# Mapeos / helpers (ES)
+# Helpers / traducciones
 # ============================
 DIR_MAP = {1: "Compra (Long)", -1: "Venta (Short)"}
 
@@ -83,67 +83,160 @@ def load_jsonl_bytes(data: bytes):
     return df, bad
 
 # ============================
-# Core: pairing trades
+# Emparejamiento robusto
 # ============================
-def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
-    entries = df[df["type"] == "ENTRY"].copy()
-    exits   = df[df["type"] == "EXIT"].copy()
+def _infer_dir_from_entry_fields(row) -> float:
+    """
+    Inferencia SOLO si tenemos datos del ENTRY:
+    - trigger vs orHigh/orLow
+    """
+    trig = row.get("trigger", np.nan)
+    oh   = row.get("orHigh", np.nan)
+    ol   = row.get("orLow", np.nan)
 
-    # ---- Normaliza columnas para evitar dir_x/dir_y confuso ----
-    if "dir" in entries.columns:
-        entries.rename(columns={"dir": "dir_entry"}, inplace=True)
-    if "dir" in exits.columns:
-        exits.rename(columns={"dir": "dir_exit"}, inplace=True)
+    if pd.isna(trig) or pd.isna(oh) or pd.isna(ol):
+        return np.nan
 
-    # ENTRY (primer evento por atmId)
+    # tolerancia mínima (tick) para evitar igualdad rara
+    if trig >= oh:
+        return 1.0
+    if trig <= ol:
+        return -1.0
+    return np.nan
+
+def pair_trades(df: pd.DataFrame, time_fallback_minutes: int = 45) -> pd.DataFrame:
+    entries_raw = df[df["type"] == "ENTRY"].copy()
+    exits_raw   = df[df["type"] == "EXIT"].copy()
+
+    # Normaliza dirs
+    if "dir" in entries_raw.columns:
+        entries_raw.rename(columns={"dir": "dir_entry"}, inplace=True)
+    if "dir" in exits_raw.columns:
+        exits_raw.rename(columns={"dir": "dir_exit"}, inplace=True)
+
+    # Asegura numéricos (si existen)
+    for c in ["dir_entry", "dir_exit", "trigger", "orHigh", "orLow", "orSize", "atr", "ewo", "deltaRatio"]:
+        if c in entries_raw.columns:
+            entries_raw[c] = pd.to_numeric(entries_raw[c], errors="coerce")
+        if c in exits_raw.columns:
+            exits_raw[c] = pd.to_numeric(exits_raw[c], errors="coerce")
+
+    # ===== 1) Pair por atmId (normal) =====
     entry_cols = [
         "atmId","ts_parsed","dir_entry","template","orderType","trigger",
         "orHigh","orLow","orSize","ewo","atr","useAtrEngine","atrSlMult",
         "tp1R","tp2R","tsBehindTP1Atr","trailStepTicks","deltaRatio","dailyPnL"
     ]
-    entry_cols = [c for c in entry_cols if c in entries.columns]
-    e1 = (entries.sort_values("ts_parsed")
-                 .groupby("atmId", as_index=False)[entry_cols]
-                 .first()
-                 .rename(columns={"ts_parsed":"entry_time"}))
+    entry_cols = [c for c in entry_cols if c in entries_raw.columns]
+    e_by_id = (entries_raw.sort_values("ts_parsed")
+                      .groupby("atmId", as_index=False)[entry_cols]
+                      .first()
+                      .rename(columns={"ts_parsed":"entry_time"}))
 
-    # EXIT (último evento por atmId)
     exit_cols = [
         "atmId","ts_parsed","outcome","exitReason","tradeRealized","dayRealized",
         "maxUnreal","minUnreal","forcedCloseReason","dailyHalt","dir_exit"
     ]
-    exit_cols = [c for c in exit_cols if c in exits.columns]
-    xlast = (exits.sort_values("ts_parsed")
-                  .groupby("atmId", as_index=False)[exit_cols]
-                  .last()
-                  .rename(columns={"ts_parsed":"exit_time"}))
+    exit_cols = [c for c in exit_cols if c in exits_raw.columns]
+    x_by_id = (exits_raw.sort_values("ts_parsed")
+                      .groupby("atmId", as_index=False)[exit_cols]
+                      .last()
+                      .rename(columns={"ts_parsed":"exit_time"}))
 
-    # Merge
-    t = xlast.merge(e1, on="atmId", how="left")
+    t = x_by_id.merge(e_by_id, on="atmId", how="left")
+    t["paired_by_time"] = False
 
-    # Numéricos
-    for c in ["tradeRealized","dayRealized","maxUnreal","minUnreal","orSize","atr","ewo","deltaRatio","dir_entry","dir_exit"]:
-        if c in t.columns:
-            t[c] = pd.to_numeric(t[c], errors="coerce")
+    # ===== 2) Fallback por tiempo (si falta ENTRY) =====
+    # Idea: si un EXIT no encontró su ENTRY por atmId, buscamos el ENTRY más cercano ANTES del exit_time
+    # dentro de una ventana (ej: 45 min) y que aún no esté "usado".
 
-    # ---- FIX PRINCIPAL: dir = dir_entry (y si falta, dir_exit) ----
+    missing_mask = t["entry_time"].isna()
+    if missing_mask.any() and not entries_raw.empty:
+        window = pd.Timedelta(minutes=time_fallback_minutes)
+
+        # Prepara lista de ENTRY (raw) ordenada por tiempo
+        e2 = entries_raw.copy()
+        e2 = e2[e2["ts_parsed"].notna()].sort_values("ts_parsed").reset_index(drop=True)
+        e2.rename(columns={"ts_parsed":"entry_time_raw"}, inplace=True)
+
+        # Mantén un set de entradas ya asignadas (por índice en e2)
+        used_entry_idx = set()
+
+        # Exits a resolver, ordenados por tiempo
+        unresolved = t[missing_mask & t["exit_time"].notna()].copy()
+        unresolved = unresolved.sort_values("exit_time").reset_index()
+
+        # puntero para ir avanzando entries <= exit_time
+        ptr = 0
+        candidates = []  # índices de entries disponibles (no usados), con entry_time_raw <= current exit_time
+
+        for _, row in unresolved.iterrows():
+            exit_time = row["exit_time"]
+            # avanza ptr agregando entries que ya ocurrieron antes de exit_time
+            while ptr < len(e2) and e2.loc[ptr, "entry_time_raw"] <= exit_time:
+                candidates.append(ptr)
+                ptr += 1
+
+            # filtra candidatos no usados y dentro de ventana
+            best = None
+            best_time = None
+            for idx in reversed(candidates):  # reversed para encontrar el más reciente rápido
+                if idx in used_entry_idx:
+                    continue
+                et = e2.loc[idx, "entry_time_raw"]
+                if exit_time - et <= window:
+                    best = idx
+                    best_time = et
+                    break
+                else:
+                    # como estamos en reversed (más recientes primero), si este ya se pasó de ventana
+                    # los más viejos estarán peor -> podemos cortar
+                    # pero ojo: en reversed, si el más reciente ya está fuera, entonces TODOS están fuera.
+                    break
+
+            if best is None:
+                continue
+
+            used_entry_idx.add(best)
+
+            # Copia campos del ENTRY RAW al trade en t
+            ridx = row["index"]  # índice real en t
+            for col in [
+                "dir_entry","template","orderType","trigger",
+                "orHigh","orLow","orSize","ewo","atr","useAtrEngine","atrSlMult",
+                "tp1R","tp2R","tsBehindTP1Atr","trailStepTicks","deltaRatio","dailyPnL"
+            ]:
+                if col in e2.columns:
+                    t.loc[ridx, col] = e2.loc[best, col]
+            t.loc[ridx, "entry_time"] = best_time
+            t.loc[ridx, "paired_by_time"] = True
+
+    # ===== 3) Construye dir final (preferencia ENTRY) =====
     if "dir_entry" in t.columns and "dir_exit" in t.columns:
-        t["dir"] = t["dir_entry"].combine_first(t["dir_exit"])
+        t["dir"] = pd.to_numeric(t["dir_entry"], errors="coerce").combine_first(
+            pd.to_numeric(t["dir_exit"], errors="coerce")
+        )
     elif "dir_entry" in t.columns:
-        t["dir"] = t["dir_entry"]
+        t["dir"] = pd.to_numeric(t["dir_entry"], errors="coerce")
     elif "dir_exit" in t.columns:
-        t["dir"] = t["dir_exit"]
+        t["dir"] = pd.to_numeric(t["dir_exit"], errors="coerce")
     else:
         t["dir"] = np.nan
 
-    # Flags básicos
-    t["has_entry"] = t["entry_time"].notna()
-    t["duration_sec"] = (t["exit_time"] - t["entry_time"]).dt.total_seconds()
-    t["dur_min"] = t["duration_sec"] / 60.0
+    # ===== 4) Si aún falta dir, intenta inferencia por trigger/orHigh/orLow =====
+    if "dir" in t.columns:
+        still = t["dir"].isna()
+        if still.any():
+            inferred = t[still].apply(_infer_dir_from_entry_fields, axis=1)
+            t.loc[still, "dir"] = inferred
 
-    # Outcome robusto (sin fillna(ndarray))
+    # ===== Outcome robusto (evita fillna(ndarray)) =====
+    for c in ["tradeRealized","dayRealized","maxUnreal","minUnreal","orSize","atr","ewo","deltaRatio"]:
+        if c in t.columns:
+            t[c] = pd.to_numeric(t[c], errors="coerce")
+
     default_outcome = pd.Series(
-        np.where(t["tradeRealized"].fillna(0) >= 0, "WIN", "LOSS"),
+        np.where(t.get("tradeRealized", 0).fillna(0) >= 0, "WIN", "LOSS"),
         index=t.index
     )
     if "outcome" not in t.columns:
@@ -158,9 +251,14 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
 
     t["forcedCloseReason"] = t.get("forcedCloseReason", "").fillna("").astype(str)
 
+    # flags / duración
+    t["has_entry"] = t["entry_time"].notna()
+    t["duration_sec"] = (t["exit_time"] - t["entry_time"]).dt.total_seconds()
+    t["dur_min"] = t["duration_sec"] / 60.0
+
     # Orden temporal + equity/drawdown
     t = t.sort_values("exit_time").reset_index(drop=True)
-    t["equity"] = t["tradeRealized"].fillna(0).cumsum()
+    t["equity"] = t.get("tradeRealized", 0).fillna(0).cumsum()
     t["equity_peak"] = t["equity"].cummax()
     t["drawdown"] = t["equity"] - t["equity_peak"]
 
@@ -214,13 +312,14 @@ def summary_block(t: pd.DataFrame) -> dict:
 
     best_streak, worst_streak = streaks_from_pnl(t["tradeRealized"])
 
-    buys  = int((t["dir"] == 1).sum()) if "dir" in t.columns else 0
-    sells = int((t["dir"] == -1).sum()) if "dir" in t.columns else 0
+    buys  = int((t["dir"] == 1).sum())
+    sells = int((t["dir"] == -1).sum())
+    unknown = int(t["dir"].isna().sum())
 
     wins = int((t["tradeRealized"] > 0).sum())
     losses = int((t["tradeRealized"] < 0).sum())
 
-    unknown = int(t["dir"].isna().sum()) if "dir" in t.columns else n
+    paired_by_time = int(t.get("paired_by_time", False).sum()) if "paired_by_time" in t.columns else 0
 
     return {
         "trades": n,
@@ -240,12 +339,10 @@ def summary_block(t: pd.DataFrame) -> dict:
         "avg_loss": avg_loss,
         "best_streak": best_streak,
         "worst_streak": worst_streak,
+        "paired_by_time": paired_by_time,
     }
 
 def side_breakdown(t: pd.DataFrame) -> pd.DataFrame:
-    if "lado" not in t.columns:
-        return pd.DataFrame()
-
     out = (t.groupby("lado", dropna=False)
              .agg(
                  trades=("atmId", "count"),
@@ -259,13 +356,9 @@ def side_breakdown(t: pd.DataFrame) -> pd.DataFrame:
              )
              .reset_index())
 
-    out["profit_factor"] = [
-        profit_factor(t[t["lado"] == lado]) for lado in out["lado"].tolist()
-    ]
+    out["profit_factor"] = [profit_factor(t[t["lado"] == lado]) for lado in out["lado"].tolist()]
 
-    # Rachas por lado (en orden temporal)
-    streak_w = []
-    streak_l = []
+    streak_w, streak_l = [], []
     for lado in out["lado"].tolist():
         g = t[t["lado"] == lado].sort_values("exit_time")
         bw, wl = streaks_from_pnl(g["tradeRealized"])
@@ -285,11 +378,11 @@ def interpretacion_rapida(s: dict):
 
     if not np.isnan(s["profit_factor"]):
         if s["profit_factor"] < 1.0:
-            warns.append(f"Profit Factor {s['profit_factor']:.2f} (<1.0) → este conjunto de reglas pierde dinero en promedio.")
+            warns.append(f"Profit Factor {s['profit_factor']:.2f} → este conjunto de reglas pierde dinero en promedio.")
         elif s["profit_factor"] < 1.2:
-            warns.append(f"Profit Factor {s['profit_factor']:.2f} (débil) → falta selectividad o ajuste de gestión (SL/TP, filtros, horarios).")
+            warns.append(f"Profit Factor {s['profit_factor']:.2f} → débil (falta filtro / gestión / horario).")
         else:
-            msgs.append(f"Profit Factor {s['profit_factor']:.2f} → bien (hay edge en este filtro).")
+            msgs.append(f"Profit Factor {s['profit_factor']:.2f} → hay edge en este filtro.")
 
     if s["max_drawdown"] < 0:
         dd = abs(s["max_drawdown"])
@@ -298,7 +391,7 @@ def interpretacion_rapida(s: dict):
             warns.append("Drawdown alto vs PnL total → estabilidad mejorable (filtros, daily stop, menos trades, evitar horas malas).")
 
     if s["worst_streak"] >= 5:
-        warns.append(f"Racha perdedora máxima = {s['worst_streak']} → necesitas plan anti-rachas (daily stop, reducir tamaño, filtros).")
+        warns.append(f"Racha perdedora máxima = {s['worst_streak']} → necesitas plan anti-rachas (daily stop, bajar tamaño, filtros).")
 
     return msgs, warns
 
@@ -308,41 +401,36 @@ def interpretacion_rapida(s: dict):
 st.title("📊 WIC_WLF2 Analizador")
 st.caption("Sube uno o varios archivos WIC_WLF2_YYYY-MM.jsonl → métricas claras, tablas legibles, gráficos y guía práctica.")
 
-with st.expander("🧠 Cómo leer esto", expanded=True):
+with st.expander("💡 Cómo leer esto", expanded=False):
     st.markdown(
         """
 **Compra (Long) / Venta (Short)**  
-- Ya lo mostramos en texto. (No necesitas ver números.)
+- Ya lo mostramos como texto (nadie necesita ver números).
 
 **Curva de capital (Equity)**  
-- Es tu “saldo acumulado” trade a trade.  
-- Si sube con caídas pequeñas → buen comportamiento.  
-- Si sube pero con caídas enormes → sistema inestable.
+- Tu PnL acumulado operación por operación.  
+- Subida “suave” + drawdown pequeño → mejor estabilidad.
 
 **Drawdown (Caída máxima)**  
-- Es la peor caída desde el máximo anterior.  
-- Te dice el **dolor máximo** que tuviste que aguantar.
+- La peor caída desde el último máximo de equity (tu peor “dolor” histórico).
 
 **Profit Factor (PF)**  
-- Compara ganancias vs pérdidas totales.  
-- PF < 1.0 → pierdes dinero.  
-- 1.0–1.2 → débil.  
-- > 1.2 → empieza a ser interesante (depende del mercado y el riesgo).
+- Ganancias totales / pérdidas totales.  
+- < 1.0 → pierde dinero  
+- 1.0–1.2 → débil  
+- > 1.2 → empieza a ser interesante (depende del riesgo)
 
 **Expectancia**  
-- PnL promedio por operación. Si es negativa, el sistema (como está) no está funcionando.
-
-**Rachas**  
-- Sirven para decidir: daily stop, tamaño, filtros, y si tu psicología/plan aguanta la varianza.
+- PnL promedio por operación. Si es negativa, necesitas ajustar filtros o gestión.
         """
     )
 
 with st.expander("🔒 Privacidad / sesiones", expanded=False):
     st.markdown(
         """
-- Cada persona que abre el link tiene **su propia sesión**.
-- Tus amigos **no ven** tus archivos subidos a menos que tú se los envíes o compartas pantalla.
-- Este app **no guarda** logs en servidor (solo analiza lo que se sube en esa sesión).
+- Cada persona que abre el link tiene **su propia sesión**.  
+- Tus amigos **no ven** tus archivos subidos (a menos que tú se los pases).  
+- Este app **no guarda** logs: solo analiza lo que se sube en esa sesión.
         """
     )
 
@@ -372,18 +460,21 @@ if not dfs:
     st.stop()
 
 df_all = pd.concat(dfs, ignore_index=True)
-trades = pair_trades(df_all)
 
-# ===== Filtros (sidebar)
+# Pairing con fallback por tiempo (ajustable)
+with st.sidebar:
+    st.subheader("⚙️ Ajustes de emparejamiento")
+    fallback_minutes = st.slider("Ventana fallback por tiempo (min)", 5, 180, 45, 5)
+
+trades = pair_trades(df_all, time_fallback_minutes=fallback_minutes)
+
+# ===== filtros (sidebar)
 st.sidebar.subheader("🎛️ Filtros")
+
 date_min = trades["exit_time"].min()
 date_max = trades["exit_time"].max()
-
-if pd.isna(date_min) or pd.isna(date_max):
-    st.error("No se pudo parsear 'ts'. Revisa formato 'YYYY-MM-DD HH:mm:ss.fff'.")
-    st.stop()
-
 d1, d2 = st.sidebar.date_input("Rango de fechas (por salida)", value=(date_min.date(), date_max.date()))
+
 mask = (pd.to_datetime(trades["exit_time"]).dt.date >= d1) & (pd.to_datetime(trades["exit_time"]).dt.date <= d2)
 
 lado_opts = sorted(trades["lado"].dropna().unique().tolist())
@@ -404,11 +495,18 @@ t["drawdown"] = t["equity"] - t["equity_peak"]
 s = summary_block(t)
 
 st.caption(f"🧾 Líneas inválidas ignoradas al parsear: {bad_total}")
+if s["paired_by_time"] > 0:
+    st.info(f"🧩 Trades emparejados por fallback de tiempo: {s['paired_by_time']} (cuando falló atmId).")
+
 if s["unknown_dir"] > 0:
-    st.warning(f"⚠️ {s['unknown_dir']} operaciones sin dirección (no se encontró dir en ENTRY/EXIT para ese atmId).")
+    st.warning(
+        f"⚠️ {s['unknown_dir']} operaciones siguen sin dirección. "
+        f"Eso significa que NO hay datos de ENTRY suficientes (ni por atmId ni por tiempo) "
+        f"para inferir el lado con seguridad."
+    )
 
 # ============================
-# Bloque 1: Lo más importante
+# Resumen rápido
 # ============================
 st.subheader("✅ Lo más importante (resumen rápido)")
 
@@ -441,33 +539,30 @@ for w in warns:
     st.warning(w)
 
 # ============================
-# Bloque 2: Por lado
+# Por lado
 # ============================
 st.subheader("🧭 Rendimiento por lado (Compra vs Venta)")
 sb = side_breakdown(t)
-if sb.empty:
-    st.info("No hay suficiente información para agrupar por lado.")
-else:
-    sb2 = sb.copy()
-    sb2["win_rate"] = (sb2["win_rate"] * 100).round(1)
-    sb2.rename(columns={
-        "lado":"Lado",
-        "trades":"Trades",
-        "wins":"Wins",
-        "losses":"Losses",
-        "win_rate":"WinRate(%)",
-        "total_pnl":"PnL Total",
-        "avg_pnl":"PnL Prom",
-        "profit_factor":"PF",
-        "max_win":"Max Win",
-        "max_loss":"Max Loss",
-        "racha_ganadora_max":"Racha Win Max",
-        "racha_perdedora_max":"Racha Loss Max",
-    }, inplace=True)
-    st.dataframe(sb2, use_container_width=True, height=260)
+sb2 = sb.copy()
+sb2["win_rate"] = (sb2["win_rate"] * 100).round(1)
+sb2.rename(columns={
+    "lado":"Lado",
+    "trades":"Trades",
+    "wins":"Wins",
+    "losses":"Losses",
+    "win_rate":"WinRate(%)",
+    "total_pnl":"PnL Total",
+    "avg_pnl":"PnL Prom",
+    "profit_factor":"PF",
+    "max_win":"Max Win",
+    "max_loss":"Max Loss",
+    "racha_ganadora_max":"Racha Win Max",
+    "racha_perdedora_max":"Racha Loss Max",
+}, inplace=True)
+st.dataframe(sb2, use_container_width=True, height=260)
 
 # ============================
-# Bloque 3: Motivos de salida
+# Motivos de salida
 # ============================
 st.subheader("🚪 Motivos de salida (impacto)")
 by_exit = (t.groupby("exitReason_ES", dropna=False)
@@ -490,7 +585,7 @@ by_exit.rename(columns={
 st.dataframe(by_exit, use_container_width=True, height=300)
 
 # ============================
-# Bloque 4: Gráficos con explicación simple
+# Gráficos
 # ============================
 st.subheader("📈 Gráficos")
 
@@ -506,15 +601,16 @@ with g2:
     st.line_chart(t.set_index("exit_time")["drawdown"])
 
 # ============================
-# Bloque 5: Trades table (humana)
+# Tabla trades
 # ============================
-st.subheader("📋 Lista de operaciones (vista humana)")
+st.subheader("📋 Lista de operaciones")
 
 cols = []
 for c in [
-    "atmId","lado","entry_time","exit_time","dur_min",
+    "atmId","lado","paired_by_time","entry_time","exit_time","dur_min",
     "tradeRealized","outcome","exitReason_ES","forcedCloseReason",
-    "orSize","atr","ewo","deltaRatio","maxUnreal","minUnreal","source_file"
+    "trigger","orHigh","orLow","orSize","atr","ewo","deltaRatio",
+    "maxUnreal","minUnreal","source_file"
 ]:
     if c in t.columns:
         cols.append(c)
@@ -523,6 +619,7 @@ t_view = t[cols].copy()
 t_view.rename(columns={
     "atmId":"TradeId",
     "lado":"Lado",
+    "paired_by_time":"Fallback tiempo",
     "entry_time":"Entrada",
     "exit_time":"Salida",
     "dur_min":"Duración (min)",
@@ -530,6 +627,9 @@ t_view.rename(columns={
     "outcome":"Resultado",
     "exitReason_ES":"Motivo salida",
     "forcedCloseReason":"Motivo forzado",
+    "trigger":"Trigger",
+    "orHigh":"OR High",
+    "orLow":"OR Low",
     "orSize":"OR Size",
     "atr":"ATR",
     "ewo":"EWO",
