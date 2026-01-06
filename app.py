@@ -308,7 +308,7 @@ def interpretacion_rapida(s: dict):
 st.title("📊 WIC_WLF2 Analizador")
 st.caption("Sube uno o varios archivos WIC_WLF2_YYYY-MM.jsonl → métricas claras, tablas legibles, gráficos y guía práctica.")
 
-with st.expander("🧠 Cómo leer esto (en humano)", expanded=True):
+with st.expander("🧠 Cómo leer esto", expanded=True):
     st.markdown(
         """
 **Compra (Long) / Venta (Short)**  
