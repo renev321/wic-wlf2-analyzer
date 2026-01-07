@@ -1661,16 +1661,44 @@ if "entry_time" in t.columns and t["entry_time"].notna().any():
     colD.metric("Días totales", f"{len(per_day)}")
 
     c1, c2 = st.columns([1,1])
+    n_days = len(per_day)
     with c1:
-        fig = px.bar(per_day, x="entry_date", y="trades", title="Trades por día")
-        fig.update_layout(xaxis_title="Día", yaxis_title="Trades")
-        st.plotly_chart(fig, use_container_width=True)
+        if n_days > 90:
+            dist = per_day.groupby("trades", as_index=False).size().rename(columns={"size":"dias"})
+            fig = px.bar(dist, x="trades", y="dias", title="Distribución: # trades por día")
+            fig.update_layout(xaxis_title="# trades en el día", yaxis_title="Días")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Con muchos días, esta distribución suele ser más útil que una barra por fecha.")
+        else:
+            fig = px.bar(per_day, x="entry_date", y="trades", title="Trades por día")
+            fig.update_layout(xaxis_title="Día", yaxis_title="Trades")
+            st.plotly_chart(fig, use_container_width=True)
     with c2:
         fig = px.scatter(per_day, x="trades", y="pnl",
                          title="¿Más trades = mejor día? (PnL día vs # trades)",
                          hover_data=["entry_date","winrate"])
         fig.update_layout(xaxis_title="# trades del día", yaxis_title="PnL del día ($)")
         st.plotly_chart(fig, use_container_width=True)
+
+        by_n = (per_day.groupby("trades", as_index=False)
+                    .agg(dias=("entry_date","size"),
+                         pnl_prom=("pnl","mean"),
+                         pnl_med=("pnl","median")))
+        fig2 = px.bar(by_n, x="trades", y="pnl_prom", color="pnl_prom",
+                      color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
+                      title="Promedio PnL del día por # trades")
+        fig2.update_layout(xaxis_title="# trades del día", yaxis_title="Promedio PnL del día ($)")
+        st.plotly_chart(fig2, use_container_width=True)
+
+        try:
+            mean_12 = by_n[by_n["trades"].isin([1,2])]["pnl_prom"].mean()
+            mean_3p = by_n[by_n["trades"]>=3]["pnl_prom"].mean()
+            n_3p_days = int(by_n[by_n["trades"]>=3]["dias"].sum()) if len(by_n[by_n["trades"]>=3]) else 0
+            if pd.notna(mean_12) and pd.notna(mean_3p) and n_3p_days >= 5 and mean_3p < mean_12:
+                st.warning("⚠️ En esta muestra, los días con **3+ trades** rinden peor en promedio. "
+                           "Prueba en el Lab **Máx trades/día = 2** o **MaxSetupsPerSession=2**.")
+        except Exception:
+            pass
 
     # Orden del trade dentro del día
     te["trade_num_day"] = te.groupby("entry_date").cumcount() + 1
@@ -1698,6 +1726,26 @@ if "entry_time" in t.columns and t["entry_time"].notna().any():
     st.write("Si ves que **#3 o #4+** baja fuerte (PF<1 o promedio<0), suele ser señal de **sobre-trading**.")
     st.dataframe(by_order, use_container_width=True, hide_index=True)
 
+    # Consejos rápidos por orden (con muestra mínima)
+    try:
+        bo = by_order.copy()
+        bo["orden_trade"] = bo["orden_trade"].astype(str)
+        # Elegimos "peor" por promedio (y PF si existe)
+        bo_sort = bo.sort_values(["pnl_prom"], ascending=True)
+        worst_row = bo_sort.iloc[0] if len(bo_sort) else None
+        if worst_row is not None and int(worst_row["trades"]) >= max(5, min_trades):
+            if float(worst_row["pnl_prom"]) < 0:
+                st.warning(f"⚠️ El **{worst_row['orden_trade']} trade** es el más flojo en esta muestra "
+                           f"(prom={float(worst_row['pnl_prom']):.0f}$, PF={float(worst_row['pf']):.2f}). "
+                           "Candidato a **limitar setups** o a subir confirmación después de 1–2 trades.")
+        # Si 4º+ existe y es negativo con algo de muestra
+        row4 = bo[bo["orden_trade"]=="4º+"]
+        if len(row4) and int(row4.iloc[0]["trades"]) >= max(5, min_trades) and float(row4.iloc[0]["pnl_prom"]) < 0:
+            st.warning("🚫 Los trades **4º+** salen negativos en promedio con muestra suficiente: "
+                       "muy típico de **sobre-trading**. Prueba **MaxSetupsPerSession=2** o **Máx trades/día=2** en el Lab.")
+    except Exception:
+        pass
+
     fig = px.bar(by_order, x="orden_trade", y="pnl_prom", color="pnl_prom",
                  color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
                  title="Promedio por trade según orden en el día")
@@ -1722,21 +1770,43 @@ if "entry_time" in t.columns and t["entry_time"].notna().any():
 
     # Solo mostramos si hay algo
     if pivot_mean.notna().sum().sum() > 0:
-        # Creamos texto como "avg\n(n=..)" para evitar confusión
+        # Formatear horas como HH:00 para que el eje sea legible (y no salga 9.5, 10.5, etc.)
+        pivot_mean = pivot_mean.sort_index(axis=1)
+        pivot_n = pivot_n.reindex(columns=pivot_mean.columns)
+
+        hour_labels = [f"{int(h):02d}:00" for h in pivot_mean.columns]
+        pivot_mean.columns = hour_labels
+        pivot_n.columns = hour_labels
+
+        # Texto dentro de cada celda: "promedio (n=..)"
         text = pivot_mean.copy()
         for r in text.index:
             for c in text.columns:
-                a = pivot_mean.loc[r,c]
-                n = pivot_n.loc[r,c]
+                a = pivot_mean.loc[r, c]
+                n = pivot_n.loc[r, c]
                 if pd.isna(a) or pd.isna(n) or n == 0:
-                    text.loc[r,c] = ""
+                    text.loc[r, c] = ""
                 else:
-                    text.loc[r,c] = f"{a:.0f}\n(n={int(n)})"
+                    text.loc[r, c] = f"{a:.0f} (n={int(n)})"
+
         try:
-            fig = px.imshow(pivot_mean, color_continuous_scale="RdYlGn",
-                            color_continuous_midpoint=0, aspect="auto")
-            fig.update_traces(text=text, texttemplate="%{text}")
-            fig.update_layout(title="Heatmap (promedio PnL $) — texto muestra n", xaxis_title="Hora", yaxis_title="Orden trade")
+            fig = px.imshow(
+                pivot_mean,
+                color_continuous_scale="RdYlGn",
+                color_continuous_midpoint=0,
+                aspect="auto",
+            )
+            fig.update_traces(
+                text=text,
+                texttemplate="%{text}",
+                customdata=pivot_n.values,
+                hovertemplate="Hora: %{x}<br>Orden: %{y}<br>Promedio: %{z:.0f}$<br>n=%{customdata}<extra></extra>",
+            )
+            fig.update_layout(
+                title="Heatmap (promedio PnL $) — muestra por celda",
+                xaxis_title="Hora (entrada)",
+                yaxis_title="Orden del trade",
+            )
             st.plotly_chart(fig, use_container_width=True)
         except Exception:
             st.info("Tu versión de Plotly no soporta este heatmap con texto. (No afecta el análisis.)")
@@ -1947,9 +2017,15 @@ else:
     dd_base = float(base_eq["drawdown"].min()) if len(base_eq) else np.nan
     dd_sim = float(sim_eq["drawdown"].min()) if len(sim_eq) else np.nan
     colx, coly, colz = st.columns(3)
-    colx.metric("Max DD base ($)", f"{dd_base:.0f}" if not np.isnan(dd_base) else "N/A")
-    coly.metric("Max DD sim ($)", f"{dd_sim:.0f}" if not np.isnan(dd_sim) else "N/A", delta=f"{(dd_sim-dd_base):.0f}" if (not np.isnan(dd_sim) and not np.isnan(dd_base)) else None)
-    colz.metric("Días cortados (reglas)", f"{len(stops_df)}")
+    dd_base_mag = abs(dd_base) if not np.isnan(dd_base) else np.nan
+    dd_sim_mag = abs(dd_sim) if not np.isnan(dd_sim) else np.nan
+
+    colx.metric("Máx caída base ($)", f"{dd_base_mag:.0f}" if not np.isnan(dd_base_mag) else "N/A")
+    coly.metric("Máx caída sim ($)", f"{dd_sim_mag:.0f}" if not np.isnan(dd_sim_mag) else "N/A",
+                delta=f"{(dd_sim_mag-dd_base_mag):.0f}" if (not np.isnan(dd_sim_mag) and not np.isnan(dd_base_mag)) else None,
+                delta_color="inverse")
+    colz.metric("Días 'cortados' (reglas)", f"{len(stops_df)}")
+    st.caption("Máx caída (Drawdown) = peor retroceso desde el pico de la curva de equity. **Más bajo = mejor**.")
 
     # Equity curve
     st.markdown("#### Curva de equity (base vs simulado)")
