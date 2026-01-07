@@ -6,6 +6,172 @@ import plotly.express as px
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
+def _best_group_for_categorical(df: pd.DataFrame, col: str, min_trades: int):
+    if col not in df.columns:
+        return None
+    rows = []
+    for g, sub in df.groupby(col):
+        n = int(len(sub))
+        if n < min_trades:
+            continue
+        exp = float(sub["tradeRealized"].mean())
+        pf = profit_factor(sub)
+        score = exp * np.log1p(n)
+        rows.append((g, n, exp, pf, score))
+    if not rows:
+        return None
+    rows.sort(key=lambda x: (x[4], x[1]), reverse=True)
+    g, n, exp, pf, score = rows[0]
+    return {"grupo": g, "n": n, "exp": exp, "pf": pf, "score": score}
+
+
+def _best_range_for_numeric(df: pd.DataFrame, col: str, q: int, min_trades: int):
+    if col not in df.columns:
+        return None
+    s = pd.to_numeric(df[col], errors="coerce")
+    if s.notna().sum() < max(15, min_trades * 2):
+        return None
+    try:
+        cuts = pd.qcut(s, q=q, duplicates="drop")
+    except Exception:
+        return None
+
+    tmp = df.copy()
+    tmp["_r"] = cuts.astype(str)
+
+    best = None
+    for g, sub in tmp.groupby("_r"):
+        n = int(len(sub))
+        if n < min_trades:
+            continue
+        exp = float(sub["tradeRealized"].mean())
+        pf = profit_factor(sub)
+        score = exp * np.log1p(n)
+        cand = {"rango": str(g), "n": n, "exp": exp, "pf": pf, "score": score}
+        if (best is None) or (cand["score"] > best["score"]):
+            best = cand
+    if best is None:
+        return None
+
+    # Intentar extraer límites numéricos del rango "(a, b]"
+    lo = hi = None
+    rg = best["rango"].strip()
+    if ("," in rg) and (rg[0] in "([") and (rg[-1] in "])"):
+        inner = rg[1:-1]
+        parts = inner.split(",")
+        if len(parts) == 2:
+            try:
+                lo = float(parts[0])
+                hi = float(parts[1])
+            except Exception:
+                lo = hi = None
+    best["lo"] = lo
+    best["hi"] = hi
+    return best
+
+
+def recommend_settings_block(known_df: pd.DataFrame, min_trades: int, recommended_trades: int):
+    """
+    Resume recomendaciones 'tipo NinjaTrader' basadas en lo que rinde mejor en ESTA muestra.
+    No inventa campos: solo usa lo que existe en el JSON.
+    """
+    if known_df is None or known_df.empty:
+        st.info("No hay suficientes trades con ENTRY para sugerir ajustes.")
+        return
+
+    n_total = int(len(known_df))
+    st.subheader("🎯 Ajustes sugeridos (según esta muestra)")
+    st.caption("Esto NO es una optimización científica; es una guía rápida. Con poca muestra, úsalo como hipótesis.")
+
+    if n_total < recommended_trades:
+        st.warning(f"Muestra pequeña: {n_total} trades con ENTRY. Recomendado ≥ {recommended_trades} para decisiones fuertes.")
+
+    # 1) Entry: StopMarket vs Limit
+    if "orderType" in known_df.columns:
+        tmp = known_df.copy()
+        ot = tmp["orderType"].astype(str).str.lower()
+        tmp["EntryType"] = np.where(ot.str.contains("stop"), "StopMarket", np.where(ot.str.contains("limit"), "Limit", tmp["orderType"].astype(str)))
+        best_entry = _best_group_for_categorical(tmp, "EntryType", min_trades=min_trades)
+    else:
+        best_entry = None
+
+    # 2) UseAtrEngine (bool)
+    best_atr_mode = _best_group_for_categorical(known_df, "useAtrEngine", min_trades=min_trades)
+
+    # 3) Rangos numéricos clave (si existen)
+    q_small = 3  # con 40 trades: rangos pocos, más estables
+    best_or = _best_range_for_numeric(known_df, "orSize", q=q_small, min_trades=min_trades)
+    best_ewo = None
+    if "ewo" in known_df.columns:
+        tmp = known_df.copy()
+        tmp["ewoAbs"] = pd.to_numeric(tmp["ewo"], errors="coerce").abs()
+        best_ewo = _best_range_for_numeric(tmp, "ewoAbs", q=q_small, min_trades=min_trades)
+
+    best_atr = _best_range_for_numeric(known_df, "atr", q=q_small, min_trades=min_trades)
+    best_atr_sl = _best_range_for_numeric(known_df, "atrSlMult", q=q_small, min_trades=min_trades)
+    best_tp1 = _best_range_for_numeric(known_df, "tp1R", q=q_small, min_trades=min_trades)
+    best_tp2 = _best_range_for_numeric(known_df, "tp2R", q=q_small, min_trades=min_trades)
+    best_ts = _best_range_for_numeric(known_df, "tsBehindTP1Atr", q=q_small, min_trades=min_trades)
+    best_step = _best_range_for_numeric(known_df, "trailStepTicks", q=q_small, min_trades=min_trades)
+
+    # 4) Render: salida tipo "parámetro -> sugerencia"
+    lines = []
+
+    def add_line(name, suggestion, note=None):
+        s = f"- **{name}**: {suggestion}"
+        if note:
+            s += f"  \n  {note}"
+        lines.append(s)
+
+    if best_entry:
+        use_stop = "True" if str(best_entry["grupo"]).lower() == "stopmarket" else "False"
+        add_line("UseStopMarketEntry", use_stop, f"(mejor grupo: {best_entry['grupo']} | n={best_entry['n']} | PF={best_entry['pf']:.2f} | prom={best_entry['exp']:.0f})")
+
+    if best_atr_mode:
+        add_line("UseAtrEngine", str(best_atr_mode["grupo"]), f"(n={best_atr_mode['n']} | PF={best_atr_mode['pf']:.2f} | prom={best_atr_mode['exp']:.0f})")
+
+    if best_or and best_or.get("lo") is not None and best_or.get("hi") is not None:
+        add_line("MinORSize / MaxORSize", f"{best_or['lo']:.2f}  →  {best_or['hi']:.2f}",
+                 f"(mejor rango ORSize | n={best_or['n']} | PF={best_or['pf']:.2f} | prom={best_or['exp']:.0f})")
+
+    if best_ewo and best_ewo.get("lo") is not None:
+        add_line("MinEWOMagnitude", f"≈ {best_ewo['lo']:.3f} (o mayor)",
+                 f"(basado en |EWO| | n={best_ewo['n']} | PF={best_ewo['pf']:.2f} | prom={best_ewo['exp']:.0f})")
+
+    if best_atr_sl and best_atr_sl.get("lo") is not None and best_atr_sl.get("hi") is not None:
+        mid = (best_atr_sl["lo"] + best_atr_sl["hi"]) / 2
+        add_line("AtrSlMult", f"≈ {mid:.2f} (rango {best_atr_sl['lo']:.2f}–{best_atr_sl['hi']:.2f})",
+                 f"(n={best_atr_sl['n']} | PF={best_atr_sl['pf']:.2f} | prom={best_atr_sl['exp']:.0f})")
+
+    if best_tp1 and best_tp1.get("lo") is not None and best_tp1.get("hi") is not None:
+        mid = (best_tp1["lo"] + best_tp1["hi"]) / 2
+        add_line("TP1_RMult", f"≈ {mid:.2f} (rango {best_tp1['lo']:.2f}–{best_tp1['hi']:.2f})",
+                 f"(n={best_tp1['n']} | PF={best_tp1['pf']:.2f} | prom={best_tp1['exp']:.0f})")
+
+    if best_tp2 and best_tp2.get("lo") is not None and best_tp2.get("hi") is not None:
+        mid = (best_tp2["lo"] + best_tp2["hi"]) / 2
+        add_line("TP2_RMult", f"≈ {mid:.2f} (rango {best_tp2['lo']:.2f}–{best_tp2['hi']:.2f})",
+                 f"(n={best_tp2['n']} | PF={best_tp2['pf']:.2f} | prom={best_tp2['exp']:.0f})")
+
+    if best_ts and best_ts.get("lo") is not None and best_ts.get("hi") is not None:
+        mid = (best_ts["lo"] + best_ts["hi"]) / 2
+        add_line("TSBehindTP1_ATR", f"≈ {mid:.2f} (rango {best_ts['lo']:.2f}–{best_ts['hi']:.2f})",
+                 f"(n={best_ts['n']} | PF={best_ts['pf']:.2f} | prom={best_ts['exp']:.0f})")
+
+    if best_step and best_step.get("lo") is not None and best_step.get("hi") is not None:
+        # ticks: mejor entero
+        mid = int(round((best_step["lo"] + best_step["hi"]) / 2))
+        add_line("TrailStepTicks", f"≈ {mid} (rango {best_step['lo']:.0f}–{best_step['hi']:.0f})",
+                 f"(n={best_step['n']} | PF={best_step['pf']:.2f} | prom={best_step['exp']:.0f})")
+
+    if not lines:
+        st.info("No hay suficientes campos/muestra para sugerir ajustes automáticos.")
+    else:
+        st.markdown("\n".join(lines))
+
+    st.caption("⚠️ Consejo: aplica 1 cambio a la vez y vuelve a medir. Evita optimizar 5 parámetros con 40 trades.")
+
+
 # ============================================================
 # (Opcional) Password: define APP_PASSWORD en Streamlit Secrets
 # ============================================================
@@ -713,82 +879,122 @@ def plot_scatter_advanced(df_known: pd.DataFrame, xcol: str, title: str):
 
 
 
+
 def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, recommended_trades: int, title: str,
                      show_scatter: bool, scatter_df: pd.DataFrame):
+    """
+    Panel por rangos (cuantiles) para un factor (OR/ATR/EWO/etc).
+    - Colores consistentes: verde = mejor, rojo = peor.
+    - Sin 'bins' en UI: todo se llama 'rangos'.
+    - Etiquetas humanas para rangos (ej: 60–94).
+    """
+    def nice_range_label(s: str) -> str:
+        if not isinstance(s, str):
+            return str(s)
+        s2 = s.strip()
+        # Formatos típicos: "(60.0, 94.0]" o "[14.5, 60.0)"
+        if ("," in s2) and (s2[0] in "([") and (s2[-1] in "])"):
+            inner = s2[1:-1]
+            parts = inner.split(",")
+            if len(parts) == 2:
+                try:
+                    a = float(parts[0])
+                    b = float(parts[1])
+                    # Redondeo “humano”
+                    if abs(a) >= 100 or abs(b) >= 100:
+                        return f"{a:.0f}–{b:.0f}"
+                    if abs(a) >= 10 or abs(b) >= 10:
+                        return f"{a:.1f}–{b:.1f}"
+                    return f"{a:.2f}–{b:.2f}"
+                except Exception:
+                    return s2
+        return s2
+
     bins = make_bins_quantiles(df_known, col, q)
     if bins is None:
         st.info(f"No hay suficiente data para crear rangos en **{title}**.")
         return
 
     tmp = df_known.copy()
-    tmp["_bin"] = bins.astype(str)
+    tmp["_range"] = bins.astype(str)
 
-    tbl = group_metrics(tmp, "_bin", min_trades=min_trades, recommended_trades=recommended_trades)
+    tbl = group_metrics(tmp, "_range", min_trades=min_trades, recommended_trades=recommended_trades)
     if tbl.empty:
         st.info(f"En **{title}** no hay data para agrupar.")
         return
+
+    # Etiquetas humanas
+    tbl["Grupo"] = tbl["Grupo"].apply(nice_range_label)
 
     # Leyenda de muestra
     n_ok = int((tbl["Estado"] == "🟢 Suficiente").sum())
     n_small = int((tbl["Estado"] == "🟡 Muestra pequeña").sum())
     n_bad = int((tbl["Estado"] == "🔴 No concluyente").sum())
-    st.caption(f"Muestra por rango: 🟢{n_ok} 🟡{n_small} 🔴{n_bad}  | "
-               f"Mínimo para mirar: {min_trades}  | Recomendado para decidir: {recommended_trades}")
+    st.caption(
+        f"Muestra por rango: 🟢{n_ok} 🟡{n_small} 🔴{n_bad}  | "
+        f"Mínimo para mirar: {min_trades}  | Recomendado para decidir: {recommended_trades}"
+    )
 
     # Para gráficos: solo rangos con muestra mínima
     tbl_chart = tbl[tbl["Trades"] >= min_trades].copy()
 
     if not tbl_chart.empty:
-        # Promedio por trade: escala divergente centrada en 0 (azul=negativo, rojo=positivo)
+        # Promedio por trade: verde = mejor, rojo = peor. Centramos en 0 (negativos quedan rojos).
         fig_exp = px.bar(
             tbl_chart,
             x="Grupo",
             y="Promedio por trade",
             color="Promedio por trade",
-            color_continuous_scale="RdBu_r",
+            color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=0,
             title=f"{title} → Promedio por trade (rangos)",
-            text_auto=True,
+            text="Promedio por trade",
         )
-        fig_exp.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10), coloraxis_colorbar_title="Promedio")
+        fig_exp.update_traces(texttemplate="%{text:.0f}", textposition="inside")
+        fig_exp.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=50, b=10),
+            coloraxis_colorbar_title="Promedio",
+        )
         fig_exp.add_hline(y=0, line_width=1, line_dash="dash")
 
-        # Profit Factor: rojo=bajo, verde=alto
+        # Profit Factor: verde = alto (mejor), rojo = bajo (peor). Punto neutro en 1.0.
         fig_pf = px.bar(
             tbl_chart,
             x="Grupo",
             y="Profit Factor",
             color="Profit Factor",
             color_continuous_scale="RdYlGn",
+            color_continuous_midpoint=1.0,
             title=f"{title} → Profit Factor (rangos)",
-            text_auto=True,
+            text="Profit Factor",
         )
-        fig_pf.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10), coloraxis_colorbar_title="PF")
+        fig_pf.update_traces(texttemplate="%{text:.2f}", textposition="inside")
+        fig_pf.update_layout(
+            height=320,
+            margin=dict(l=10, r=10, t=50, b=10),
+            coloraxis_colorbar_title="PF",
+        )
         fig_pf.add_hline(y=1.0, line_width=1, line_dash="dash")
 
         st.plotly_chart(fig_exp, use_container_width=True)
         st.plotly_chart(fig_pf, use_container_width=True)
-        st.caption("Profit Factor (PF) = Ganancias totales / Pérdidas totales. PF>1 indica que el conjunto gana; PF>1.5 suele ser muy sólido (con muestra suficiente).")
 
-        advice_from_table(tbl_chart, title=title, min_trades=min_trades)
+        st.caption("Profit Factor (PF) = Ganancias totales / Pérdidas totales. PF>1 indica que el conjunto gana. "
+                   "PF>1.5 suele ser sólido si la muestra es suficiente (🟢).")
+
+        advice_from_table(tbl_chart, title, min_trades=min_trades)
     else:
-        st.warning("⚠️ Todo queda con muestra muy pequeña para gráficos. Se muestra tabla completa abajo.")
+        st.info("⚠️ Con el mínimo actual, todos los rangos quedan con poca muestra. Úsalo como idea, no como regla.")
 
     st.dataframe(tbl, use_container_width=True)
 
-    st.markdown("**🧠 Zonas recomendadas / peligrosas (automático):**")
-    for s in factor_danger_zone_insights(df_known, col, q, min_trades, title):
-        if "🚫" in s:
-            st.warning(s)
-        elif "✅" in s:
-            st.success(s)
-        elif "🚨" in s:
-            st.error(s)
-        else:
-            st.info(s)
-
     if show_scatter:
-        plot_scatter_advanced(scatter_df, col, f"{title}: Scatter PnL vs {col}")
-
+        st.markdown("**Scatter (solo para ver dispersión / outliers)**")
+        if col in scatter_df.columns and scatter_df[col].notna().sum() >= max(20, min_trades):
+            plot_scatter_advanced(scatter_df, col, title=f"{title} → Scatter")
+        else:
+            st.info("No hay suficiente data para scatter en este factor.")
 
 def plot_hour_analysis(t: pd.DataFrame, min_trades: int):
     tbl = group_metrics(t, "exit_hour_label", min_trades=min_trades)
@@ -804,6 +1010,7 @@ def plot_hour_analysis(t: pd.DataFrame, min_trades: int):
     st.dataframe(tbl, use_container_width=True)
     advice_from_table(tbl, title="Hora", min_trades=min_trades)
     return tbl
+
 
 
 def plot_heatmap_weekday_hour(t: pd.DataFrame, min_trades: int):
@@ -843,22 +1050,46 @@ def plot_heatmap_weekday_hour(t: pd.DataFrame, min_trades: int):
     zmin = -max_abs if max_abs else None
     zmax = max_abs if max_abs else None
 
-    fig = px.imshow(
-        pivot,
-        aspect="auto",
-        title=f"Heatmap: Promedio por trade (Día x Hora) | solo celdas con ≥ {min_trades} trades",
-        origin="lower",
-        color_continuous_scale="RdBu_r",
-        zmin=zmin,
-        zmax=zmax,
-        zmid=0,
-        text_auto=True,
-    )
+    # Compatibilidad: algunas versiones de Plotly no soportan text_auto en imshow.
+    try:
+        fig = px.imshow(
+            pivot,
+            aspect="auto",
+            title=f"Heatmap: Promedio por trade (Día x Hora) | solo celdas con ≥ {min_trades} trades",
+            origin="lower",
+            color_continuous_scale="RdBu_r",
+            zmin=zmin,
+            zmax=zmax,
+            color_continuous_midpoint=0,
+            text_auto=True,
+        )
+    except TypeError:
+        fig = px.imshow(
+            pivot,
+            aspect="auto",
+            title=f"Heatmap: Promedio por trade (Día x Hora) | solo celdas con ≥ {min_trades} trades",
+            origin="lower",
+            color_continuous_scale="RdBu_r",
+            zmin=zmin,
+            zmax=zmax,
+            color_continuous_midpoint=0,
+        )
+        # Añadimos etiquetas manuales (valores)
+        for yi, day in enumerate(pivot.index.astype(str).tolist()):
+            for xi, hour in enumerate(pivot.columns.tolist()):
+                v = pivot.loc[pivot.index[yi], hour]
+                if pd.notna(v):
+                    fig.add_annotation(
+                        x=hour,
+                        y=day,
+                        text=f"{v:.0f}",
+                        showarrow=False,
+                        font=dict(size=11, color="black"),
+                    )
+
     fig.update_layout(height=460, margin=dict(l=10, r=10, t=60, b=10))
     st.plotly_chart(fig, use_container_width=True)
     st.caption("Azul = promedio negativo, rojo = promedio positivo. Si casi todo queda vacío, baja el mínimo (muestra pequeña).")
-    st.caption("Lectura: celdas positivas = mejor promedio/trade. Vacías = poca muestra (no concluyente).")
-
 
 # ============================================================
 # UI
@@ -1375,6 +1606,8 @@ if hour_tbl is not None and not hour_tbl.empty:
     st.write(f"- {best['Grupo']} | Trades={int(best['Trades'])} | PF={float(best['Profit Factor']):.2f} | Promedio={float(best['Promedio por trade']):.1f}")
     if int(best["Trades"]) < min_trades * 2:
         st.info("Nota: el mejor horario aún tiene poca muestra. Confirma con más meses antes de convertirlo en regla.")
+
+recommend_settings_block(known, min_trades=min_trades, recommended_trades=recommended_trades)
 
 st.markdown("**Siguientes pasos recomendados (orden)**")
 st.write("1) Primero elimina lo rojo: horarios peores + condiciones con PF<1 (muestra 🟢).")
