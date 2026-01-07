@@ -635,14 +635,14 @@ def equity_recovery_insights(t: pd.DataFrame):
 def factor_danger_zone_insights(df_known: pd.DataFrame, xcol: str, q: int, min_trades: int, title: str):
     bins = make_bins_quantiles(df_known, xcol, q)
     if bins is None:
-        return ["ℹ️ No hay suficiente data para detectar zonas por bins."]
+        return ["ℹ️ No hay suficiente data para detectar zonas por rangos."]
 
     tmp = df_known.copy()
     tmp["_bin"] = bins.astype(str)
     tbl = group_metrics(tmp, "_bin", min_trades=min_trades)
 
     if tbl.empty:
-        return [f"ℹ️ No hay bins con ≥ {min_trades} trades para {title}."]
+        return [f"ℹ️ No hay rangos con ≥ {min_trades} trades para {title}."]
 
     # zonas malas
     bad = tbl[(tbl["Promedio por trade"] < 0) & (tbl["Profit Factor"] < 1.0)].copy()
@@ -653,7 +653,7 @@ def factor_danger_zone_insights(df_known: pd.DataFrame, xcol: str, q: int, min_t
         b = bad.sort_values("Score (ponderado)").iloc[0]
         insights.append(f"🚫 Zona peligrosa: **{b['Grupo']}** → promedio<0 y PF<1 (candidato a EVITAR).")
     else:
-        insights.append("✅ No se detectan bins claramente peligrosos (con muestra suficiente).")
+        insights.append("✅ No se detectan rangos claramente peligrosos (con muestra suficiente).")
 
     if not good.empty:
         g = good.sort_values("Score (ponderado)", ascending=False).iloc[0]
@@ -717,7 +717,7 @@ def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, 
                      show_scatter: bool, scatter_df: pd.DataFrame):
     bins = make_bins_quantiles(df_known, col, q)
     if bins is None:
-        st.info(f"No hay suficiente data para crear rangos (bins) en **{title}**.")
+        st.info(f"No hay suficiente data para crear rangos en **{title}**.")
         return
 
     tmp = df_known.copy()
@@ -732,18 +732,18 @@ def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, 
     n_ok = int((tbl["Estado"] == "🟢 Suficiente").sum())
     n_small = int((tbl["Estado"] == "🟡 Muestra pequeña").sum())
     n_bad = int((tbl["Estado"] == "🔴 No concluyente").sum())
-    st.caption(f"Muestra por bin: 🟢{n_ok} 🟡{n_small} 🔴{n_bad}  | "
+    st.caption(f"Muestra por rango: 🟢{n_ok} 🟡{n_small} 🔴{n_bad}  | "
                f"Mínimo para mirar: {min_trades}  | Recomendado para decidir: {recommended_trades}")
 
-    # Para gráficos: solo bins con muestra mínima
+    # Para gráficos: solo rangos con muestra mínima
     tbl_chart = tbl[tbl["Trades"] >= min_trades].copy()
 
     if not tbl_chart.empty:
-        fig_exp = px.bar(tbl_chart, x="Grupo", y="Promedio por trade", title=f"{title} → Promedio por trade (bins)")
+        fig_exp = px.bar(tbl_chart, x="Grupo", y="Promedio por trade", title=f"{title} → Promedio por trade (rangos)")
         fig_exp.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
         fig_exp.add_hline(y=0, line_width=1, line_dash="dash")
 
-        fig_pf = px.bar(tbl_chart, x="Grupo", y="Profit Factor", title=f"{title} → Profit Factor (bins)")
+        fig_pf = px.bar(tbl_chart, x="Grupo", y="Profit Factor", title=f"{title} → Profit Factor (rangos)")
         fig_pf.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
         fig_pf.add_hline(y=1.0, line_width=1, line_dash="dash")
 
@@ -783,12 +783,22 @@ def plot_hour_analysis(t: pd.DataFrame, min_trades: int):
     st.plotly_chart(fig, use_container_width=True)
 
     st.dataframe(tbl, use_container_width=True)
-    advice_from_table(tbl, title="Hora (bucket)", min_trades=min_trades)
+    advice_from_table(tbl, title="Hora", min_trades=min_trades)
     return tbl
 
 
 def plot_heatmap_weekday_hour(t: pd.DataFrame, min_trades: int):
     tmp = t.copy()
+
+    if "exit_time" not in tmp.columns or tmp["exit_time"].isna().all():
+        st.info("No hay exit_time válido para generar el heatmap.")
+        return
+
+    tmp = tmp.dropna(subset=["exit_time"]).copy()
+    tmp["weekday"] = tmp["exit_time"].dt.day_name()
+    if "exit_hour" not in tmp.columns or tmp["exit_hour"].isna().all():
+        tmp["exit_hour"] = tmp["exit_time"].dt.hour
+
     weekday_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
     tmp["weekday_order"] = pd.Categorical(tmp["weekday"], categories=weekday_order, ordered=True)
 
@@ -853,7 +863,7 @@ if missing_entry > 0:
 st.sidebar.subheader("⚙️ Ajustes")
 min_trades = st.sidebar.slider("Mínimo trades por grupo (para mirar)", 5, 120, 30, 5)
 recommended_trades = st.sidebar.slider("Trades recomendados por grupo (para decidir)", 20, 300, 80, 10)
-q_bins = st.sidebar.slider("Número de rangos (bins por cuantiles)", 3, 12, 5, 1)
+q_bins = st.sidebar.slider("Número de rangos (cuantiles)", 3, 12, 5, 1)
 
 show_adv_scatter = st.sidebar.checkbox("Mostrar scatter (útil para ver outliers)", value=False)
 last_n_scatter = st.sidebar.slider("Scatter: últimos N trades (0=todo)", 0, 3000, 800, 100)
@@ -954,7 +964,7 @@ else:
     if (rr_df["rr"] >= 1).mean() < 0.35:
         st.warning("⚠️ Pocos trades llegan a RR≥1. Revisa: entrar tarde, SL muy grande, o TP demasiado corto.")
     if (rr_df["rr"] <= -1).mean() > 0.10:
-        st.warning("🚨 Muchas pérdidas ≥ 1R. Revisa stops (slippage), noticias, o entradas sin confirmación.")
+        st.warning("🚨 Muchas pérdidas de 1R o más (RR ≤ -1). Revisa: slippage, noticias, stops muy ajustados o entradas sin confirmación.")
     if rr_df["rr"].median() > 0.3 and (rr_df["rr"] >= 1).mean() > 0.45:
         st.success("✅ Estructura de RR saludable (según esta muestra). Aun así: valida con más trades.")
 
@@ -978,7 +988,8 @@ else:
 
     # RR por plantilla / tipo de orden
     split_cols = []
-    for c in ["template", "orderType", "trigger", "lado"]:
+    # Evitamos 'trigger' porque suele ser demasiado genérico y confunde a usuarios finales.
+    for c in ["template", "orderType", "exitReason", "lado"]:
         if c in rr_df.columns and rr_df[c].notna().sum() > 0:
             split_cols.append(c)
 
