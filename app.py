@@ -954,6 +954,16 @@ else:
     c4.metric("% RR ≥ 2", f"{(rr_df['rr'] >= 2).mean()*100:.1f}%")
     c5.metric("Trades con RR", f"{len(rr_df)}")
 
+    # Métricas extra (más fáciles de leer con muestras pequeñas)
+    rr_wins = rr_df.loc[rr_df["rr"] > 0, "rr"]
+    rr_losses = rr_df.loc[rr_df["rr"] < 0, "rr"]
+    small_losses = rr_df[(rr_df["rr"] < 0) & (rr_df["rr"] > -0.5)]
+
+    c6, c7, c8 = st.columns(3)
+    c6.metric("RR promedio (ganadores)", f"{rr_wins.mean():.2f}" if not rr_wins.empty else "N/A")
+    c7.metric("RR promedio (perdedores)", f"{rr_losses.mean():.2f}" if not rr_losses.empty else "N/A")
+    c8.metric("% pérdidas pequeñas (-0.5R a 0)", f"{len(small_losses)/len(rr_df)*100:.1f}%" if len(rr_df) else "N/A")
+
     fig_rr = px.histogram(rr_df, x="rr", nbins=30, title="Distribución de RR (Ganancia/Riesgo)")
     fig_rr.add_vline(x=0, line_width=1, line_dash="dash")
     fig_rr.add_vline(x=1, line_width=1, line_dash="dash")
