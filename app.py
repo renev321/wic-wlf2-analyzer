@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import json
 import plotly.express as px
+from datetime import time
 
 st.set_page_config(page_title="WIC_WLF2 Analizador", layout="wide")
 
@@ -21,7 +22,7 @@ if APP_PASSWORD:
 # Helpers parse/normalize
 # ============================================================
 def parse_jsonl_bytes(b: bytes):
-    txt = b.decode("utf-8", errors="replace")
+    txt = b.decode("utf-8-sig", errors="replace")
     recs, bad = [], 0
     for line in txt.splitlines():
         line = line.strip()
@@ -200,6 +201,16 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
     t["exit_date"] = pd.to_datetime(t["exit_time"]).dt.date
     t["exit_hour"] = pd.to_datetime(t["exit_time"]).dt.hour
     t["exit_hour_label"] = t["exit_hour"].apply(hour_bucket_label)
+    # Aliases for compatibility with earlier versions
+    t["exit_ts"] = t["exit_time"]
+    t["entry_ts"] = t.get("entry_time", pd.NaT)
+
+    # Derived exit reason: treat strategy-driven reversals as REVERSAL (not MANUAL)
+    t["exitReasonRaw"] = t.get("exitReason", pd.Series(index=t.index, data="UNKNOWN")).fillna("UNKNOWN")
+    t["exitReasonClean"] = t["exitReasonRaw"]
+    fcr = t.get("forcedCloseReason", pd.Series(index=t.index, data="")).fillna("").astype(str)
+    is_rev = (t["exitReasonRaw"].astype(str).str.upper() == "MANUAL") & fcr.str.contains("reversal", case=False, na=False)
+    t.loc[is_rev, "exitReasonClean"] = "REVERSAL"
 
     # weekday (keep english internal, easier for ordering)
     t["weekday"] = pd.to_datetime(t["exit_time"]).dt.day_name()
@@ -473,7 +484,7 @@ def plot_scatter_advanced(df_known: pd.DataFrame, xcol: str, title: str,
     except Exception:
         sm = None
 
-    tmp = df_known[[xcol, "tradeRealized", "exit_time", "lado", "exitReason"]].dropna().copy()
+    tmp = df_known[[xcol, "tradeRealized", "exit_time", "lado", "exitReasonClean"]].dropna().copy()
     tmp["Resultado"] = np.where(tmp["tradeRealized"] >= 0, "Ganancia", "Pérdida")
 
     fig = px.scatter(
@@ -482,7 +493,7 @@ def plot_scatter_advanced(df_known: pd.DataFrame, xcol: str, title: str,
         y="tradeRealized",
         color="Resultado",
         color_discrete_map={"Ganancia": "green", "Pérdida": "red"},
-        hover_data=["exit_time", "lado", "exitReason", "tradeRealized"],
+        hover_data=["exit_time", "lado", "exitReasonClean", "tradeRealized"],
         title=f"{title}"
     )
     fig.update_traces(marker=dict(size=6, opacity=0.55))
@@ -662,19 +673,132 @@ if missing_entry > 0:
     )
 
 # Sidebar controls
-st.sidebar.subheader("⚙️ Ajustes")
-min_trades = st.sidebar.slider("Mínimo trades por grupo (confiable)", 5, 120, 30, 5)
-q_bins = st.sidebar.slider("Número de rangos (bins por cuantiles)", 3, 12, 5, 1)
+st.sidebar.markdown("## ⚙️ Configuración")
+simple_mode = st.sidebar.checkbox("Modo simple (para no expertos)", value=True)
 
-show_adv_scatter = st.sidebar.checkbox("Mostrar scatters (modo avanzado)", value=True)
-trend_mode = st.sidebar.selectbox(
-    "Línea de tendencia (scatter)",
-    ["Ninguna", "Regresión (OLS)", "Suavizado (LOWESS)"],
-    index=1
-)
-lowess_frac = st.sidebar.slider("LOWESS suavidad (solo si LOWESS)", 0.05, 0.60, 0.25, 0.05)
-last_n_scatter = st.sidebar.slider("Scatters: últimos N trades (0=todo)", 0, 3000, 800, 100)
+if simple_mode:
+    show_adv_scatter = False
+    show_trend = False
+    trend_mode = "Ninguna"
+    lowess_frac = 0.25
+    last_n_scatter = 2000
+else:
+    show_adv_scatter = st.sidebar.checkbox("Mostrar scatter avanzado", value=False)
+    show_trend = st.sidebar.checkbox("Mostrar tendencia (avanzado)", value=False)
+    trend_mode = "Ninguna"
+    if show_trend:
+        trend_mode = st.sidebar.selectbox(
+            "Línea de tendencia (PnL vs #trade)",
+            ["Ninguna", "Lineal", "Cuadrática", "Regresión (OLS)"],
+            index=0
+        )
+    lowess_frac = st.sidebar.slider("LOWESS frac (si se usa)", 0.05, 0.6, 0.25, 0.05)
+    last_n_scatter = st.sidebar.number_input("Últimos N trades en scatter (si se usa)", 100, 20000, 2000, 100)
 
+# Time analysis: useful for everyone; keep heatmap as optional advanced
+show_time_analysis = st.sidebar.checkbox("Análisis por horario / día", value=True)
+show_heatmap = False
+if not simple_mode:
+    show_heatmap = st.sidebar.checkbox("Mostrar heatmap (avanzado)", value=False)
+
+show_log_tables = st.sidebar.checkbox("Mostrar tablas de logs (avanzado)", value=False)
+
+st.sidebar.markdown("## 🔎 Filtros")
+
+t_all = t.copy()
+
+# Date range (based on exit)
+if "exit_time" in t_all.columns and t_all["exit_time"].notna().any():
+    min_d = t_all["exit_time"].dt.date.min()
+    max_d = t_all["exit_time"].dt.date.max()
+    dr = st.sidebar.date_input("Rango de fechas (EXIT)", value=(min_d, max_d), min_value=min_d, max_value=max_d)
+    if isinstance(dr, tuple) and len(dr) == 2:
+        d0, d1 = dr
+    else:
+        d0, d1 = min_d, max_d
+else:
+    d0, d1 = None, None
+
+dir_opts = sorted([x for x in t_all.get("lado", pd.Series(dtype=str)).dropna().unique()])
+dir_sel = st.sidebar.multiselect("Dirección", dir_opts, default=dir_opts)
+
+out_opts = sorted([x for x in t_all.get("outcome", pd.Series(dtype=str)).dropna().unique()])
+out_sel = st.sidebar.multiselect("Outcome", out_opts, default=out_opts)
+
+exit_opts = sorted([x for x in t_all.get("exitReasonClean", t_all.get("exitReason", pd.Series(dtype=str))).dropna().unique()])
+exit_sel = st.sidebar.multiselect("Exit reason (clean)", exit_opts, default=exit_opts)
+
+tpl_opts = sorted([x for x in t_all.get("template", pd.Series(dtype=str)).dropna().unique()])
+tpl_sel = st.sidebar.multiselect("Template", tpl_opts, default=tpl_opts)
+
+# Numeric ranges (only if columns exist)
+def _range_slider(col, label, step=1.0):
+    if col in t_all.columns and t_all[col].notna().any():
+        vmin = float(np.nanmin(t_all[col]))
+        vmax = float(np.nanmax(t_all[col]))
+        if vmin == vmax:
+            return (vmin, vmax)
+        return st.sidebar.slider(label, vmin, vmax, (vmin, vmax), step=step)
+    return None
+
+or_rng = _range_slider("orSize", "OR size", step=1.0)
+atr_rng = _range_slider("atr", "ATR", step=0.1)
+ewo_rng = _range_slider("ewoValue", "EWO", step=0.01)
+
+# Time window filters
+use_entry_time = st.sidebar.checkbox("Filtrar por hora de entrada", value=False)
+entry_start = st.sidebar.time_input("Entrada desde", value=time(0, 0))
+entry_end = st.sidebar.time_input("Entrada hasta", value=time(23, 59))
+
+use_exit_time = st.sidebar.checkbox("Filtrar por hora de salida", value=False)
+exit_start = st.sidebar.time_input("Salida desde", value=time(0, 0))
+exit_end = st.sidebar.time_input("Salida hasta", value=time(23, 59))
+
+# Apply filters
+mask = pd.Series(True, index=t_all.index)
+
+if d0 is not None and d1 is not None and "exit_time" in t_all.columns:
+    mask &= t_all["exit_time"].dt.date.between(d0, d1)
+
+if dir_sel and "lado" in t_all.columns:
+    mask &= t_all["lado"].isin(dir_sel)
+
+if out_sel and "outcome" in t_all.columns:
+    mask &= t_all["outcome"].isin(out_sel)
+
+if exit_sel:
+    col = "exitReasonClean" if "exitReasonClean" in t_all.columns else "exitReason"
+    if col in t_all.columns:
+        mask &= t_all[col].isin(exit_sel)
+
+if tpl_sel and "template" in t_all.columns:
+    mask &= t_all["template"].isin(tpl_sel)
+
+if or_rng is not None:
+    mask &= t_all["orSize"].between(or_rng[0], or_rng[1])
+
+if atr_rng is not None:
+    mask &= t_all["atr"].between(atr_rng[0], atr_rng[1])
+
+if ewo_rng is not None:
+    mask &= t_all["ewoValue"].between(ewo_rng[0], ewo_rng[1])
+
+def _time_between(series_dt, t0, t1):
+    # handles wrap over midnight
+    tt = series_dt.dt.time
+    if t0 <= t1:
+        return (tt >= t0) & (tt <= t1)
+    return (tt >= t0) | (tt <= t1)
+
+if use_entry_time and "entry_time" in t_all.columns and t_all["entry_time"].notna().any():
+    mask &= _time_between(t_all["entry_time"], entry_start, entry_end)
+
+if use_exit_time and "exit_time" in t_all.columns and t_all["exit_time"].notna().any():
+    mask &= _time_between(t_all["exit_time"], exit_start, exit_end)
+
+t = t_all.loc[mask].copy()
+
+st.sidebar.caption(f"Trades filtrados: {len(t)} / {len(t_all)}")
 summary = summarize(t)
 
 # ============================================================
@@ -741,6 +865,44 @@ for s in pnl_shape_insights(t):
         st.info(s)
 
 # ============================================================
+
+
+# Simple, high-signal charts (better for non-advanced users)
+st.markdown("### 🎯 Motivo de salida (ExitReason)")
+exit_stats = (
+    t.groupby("exitReasonClean", dropna=False)
+     .agg(trades=("tradeRealized", "size"),
+          pnl=("tradeRealized", "sum"),
+          avg=("tradeRealized", "mean"))
+     .reset_index()
+     .sort_values("pnl", ascending=False)
+)
+fig_exit = px.bar(exit_stats, x="exitReasonClean", y="pnl", hover_data=["trades", "avg"], title=None)
+st.plotly_chart(fig_exit, use_container_width=True)
+
+st.markdown("### 📅 PnL diario")
+daily = t.copy()
+daily["exit_date"] = pd.to_datetime(daily.get("exit_ts", daily.get("exit_time"))).dt.date
+daily_tbl = (
+    daily.groupby("exit_date", as_index=False)
+         .agg(pnl=("tradeRealized", "sum"), trades=("tradeRealized", "size"))
+         .sort_values("exit_date")
+)
+fig_daily = px.bar(daily_tbl, x="exit_date", y="pnl", hover_data=["trades"], title=None)
+st.plotly_chart(fig_daily, use_container_width=True)
+
+st.markdown("### 🧲 Riesgo vs potencial (MAE vs MFE)")
+rm = t.copy()
+rm["MAE"] = np.where(rm["minUnreal"] < 0, -rm["minUnreal"], 0.0)
+rm["MFE"] = np.where(rm["maxUnreal"] > 0, rm["maxUnreal"], 0.0)
+rm["Eficiencia"] = np.where(rm["MFE"] > 0, rm["tradeRealized"] / rm["MFE"], np.nan)
+fig_mae = px.scatter(
+    rm, x="MAE", y="MFE",
+    hover_data=["atmId", "dir", "exitReasonClean", "tradeRealized", "Eficiencia"],
+    title=None
+)
+st.plotly_chart(fig_mae, use_container_width=True)
+st.caption("MAE = lo peor que fue el trade antes de salir (adverso). MFE = lo mejor que fue (favorable). Ideal: MAE bajo y MFE alto.")
 # Long vs Short
 # ============================================================
 st.subheader("🧭 Compra vs Venta (solo donde hay ENTRY)")
@@ -809,38 +971,41 @@ else:
 
 # ============================================================
 # Hours
-# ============================================================
-st.subheader("⏰ Horarios (justo y confiable)")
+if show_time_analysis:
+    # ============================================================
+    st.subheader("⏰ Horarios (justo y confiable)")
 
-hour_tbl = plot_hour_analysis(t, min_trades=min_trades)
-plot_heatmap_weekday_hour(t, min_trades=min_trades)
+    hour_tbl = plot_hour_analysis(t, min_trades=min_trades)
+    if show_heatmap:
+        plot_heatmap_weekday_hour(t, min_trades=min_trades)
 
-st.markdown("### 🧠 Consejos automáticos (Horarios)")
-if hour_tbl is None or hour_tbl.empty:
-    st.info("No hay datos suficientes por hora con el mínimo configurado.")
-else:
-    best = hour_tbl.iloc[0]
-    worst = hour_tbl.iloc[-1]
+    st.markdown("### 🧠 Consejos automáticos (Horarios)")
+    if hour_tbl is None or hour_tbl.empty:
+        st.info("No hay datos suficientes por hora con el mínimo configurado.")
+    else:
+        best = hour_tbl.iloc[0]
+        worst = hour_tbl.iloc[-1]
 
-    st.info(
-        f"🏆 Hora recomendada: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
-        f"{traffic_pf(best['Profit Factor'])} | {traffic_exp(best['Promedio por trade'])}"
-    )
-    if best["Trades"] < min_trades * 2:
-        st.warning("⚠️ La mejor hora aún tiene muestra pequeña. Confirma con más logs.")
+        st.info(
+            f"🏆 Hora recomendada: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
+            f"{traffic_pf(best['Profit Factor'])} | {traffic_exp(best['Promedio por trade'])}"
+        )
+        if best["Trades"] < min_trades * 2:
+            st.warning("⚠️ La mejor hora aún tiene muestra pequeña. Confirma con más logs.")
 
-    if not np.isnan(worst["Profit Factor"]) and worst["Profit Factor"] < 1.0:
-        st.warning(f"🚫 Hora candidata a evitar: **{worst['Grupo']}** (PF < 1 y promedio bajo).")
+        if not np.isnan(worst["Profit Factor"]) and worst["Profit Factor"] < 1.0:
+            st.warning(f"🚫 Hora candidata a evitar: **{worst['Grupo']}** (PF < 1 y promedio bajo).")
 
-    st.caption("Regla de oro: prefiere horas con buen Score ponderado + buen PF + buena muestra, no solo winrate.")
+        st.caption("Regla de oro: prefiere horas con buen Score ponderado + buen PF + buena muestra, no solo winrate.")
 
-# ============================================================
+    # ============================================================
+
 # Trades table
 # ============================================================
 with st.expander("📄 Tabla de trades (una fila por atmId)", expanded=False):
     cols_show = [c for c in [
         "exit_time", "entry_time", "lado", "outcome", "tradeRealized",
-        "maxUnreal", "minUnreal", "exitReason", "forcedCloseReason",
+        "maxUnreal", "minUnreal", "exitReasonClean", "exitReason", "forcedCloseReason",
         "orSize", "ewo", "atr", "deltaRatio", "atrSlMult", "tp1R", "tp2R",
         "duration_sec"
     ] if c in t.columns]
