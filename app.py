@@ -847,7 +847,21 @@ def plot_equity_drawdown(t: pd.DataFrame):
 
 
 def plot_pnl_hist(t: pd.DataFrame):
-    fig = px.histogram(t, x="tradeRealized", nbins=40, title="Distribución de PnL por operación")
+    """Histograma de PnL realizado (dinero). tradeRealized está en la moneda de la cuenta (normalmente $)."""
+    tmp = t.copy()
+    tr = pd.to_numeric(tmp.get("tradeRealized"), errors="coerce")
+    tmp["Resultado"] = np.where(tr >= 0, "Ganancia", "Pérdida")
+
+    fig = px.histogram(
+        tmp,
+        x="tradeRealized",
+        color="Resultado",
+        nbins=40,
+        barmode="overlay",
+        title="Distribución de PnL ($) por operación",
+        labels={"tradeRealized": "PnL ($)"},
+    )
+    fig.update_traces(opacity=0.75)
     fig.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
     fig.add_vline(x=0, line_width=1, line_dash="dash")
     return fig
@@ -923,8 +937,41 @@ def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, 
         st.info(f"En **{title}** no hay data para agrupar.")
         return
 
-    # Etiquetas humanas
-    tbl["Grupo"] = tbl["Grupo"].apply(nice_range_label)
+    # Etiquetas humanas (más fáciles de leer)
+    _orig = tbl["Grupo"].astype(str).tolist()
+    _nice = [nice_range_label(x) for x in _orig]
+
+    def _parse_left(rg: str):
+        rg = str(rg).strip()
+        if ("," in rg) and (rg[0] in "([") and (rg[-1] in "])"):
+            inner = rg[1:-1]
+            parts = inner.split(",")
+            if len(parts) == 2:
+                try:
+                    return float(parts[0])
+                except Exception:
+                    return np.nan
+        return np.nan
+
+    lefts = [(_parse_left(o), i) for i, o in enumerate(_orig)]
+    order = [i for _, i in sorted(lefts, key=lambda x: (np.nan_to_num(x[0], nan=1e18), x[1]))]
+
+    k = len(_nice)
+    if k == 3:
+        names = ["Bajo", "Medio", "Alto"]
+    elif k == 4:
+        names = ["Bajo", "Medio-bajo", "Medio-alto", "Alto"]
+    elif k == 5:
+        names = ["Muy bajo", "Bajo", "Medio", "Alto", "Muy alto"]
+    else:
+        names = [f"R{i+1}" for i in range(k)]
+
+    label_map = {}
+    for rank, idx in enumerate(order):
+        base = names[rank] if rank < len(names) else f"R{rank+1}"
+        label_map[_orig[idx]] = f"{base} ({_nice[idx]})"
+
+    tbl["Grupo"] = tbl["Grupo"].astype(str).map(label_map).fillna(tbl["Grupo"].astype(str))
 
     # Leyenda de muestra
     n_ok = int((tbl["Estado"] == "🟢 Suficiente").sum())
@@ -1207,6 +1254,7 @@ for s in equity_recovery_insights(t):
         st.success(s)
 
 st.plotly_chart(plot_pnl_hist(t), use_container_width=True)
+st.caption("PnL ($) = dinero realizado por trade (tradeRealized). Si quieres verlo en ticks/points, se puede derivar con tickSize/pointValue, pero aquí mostramos la realidad de la cuenta.")
 
 st.markdown("### 🧠 Consejos automáticos (Distribución de PnL)")
 for s in pnl_shape_insights(t):
@@ -1250,7 +1298,18 @@ else:
     c7.metric("RR promedio (perdedores)", f"{rr_losses.mean():.2f}" if not rr_losses.empty else "N/A")
     c8.metric("% pérdidas pequeñas (-0.5R a 0)", f"{len(small_losses)/len(rr_df)*100:.1f}%" if len(rr_df) else "N/A")
 
-    fig_rr = px.histogram(rr_df, x="rr", nbins=30, title="Distribución de RR (Ganancia/Riesgo)")
+    rr_tmp = rr_df.copy()
+    rr_tmp["Resultado"] = np.where(rr_tmp["rr"] >= 0, "Ganancia", "Pérdida")
+    fig_rr = px.histogram(
+        rr_tmp,
+        x="rr",
+        color="Resultado",
+        nbins=30,
+        barmode="overlay",
+        title="Distribución de RR (Ganancia/Riesgo)",
+        labels={"rr": "RR"},
+    )
+    fig_rr.update_traces(opacity=0.75)
     fig_rr.add_vline(x=0, line_width=1, line_dash="dash")
     fig_rr.add_vline(x=1, line_width=1, line_dash="dash")
     fig_rr.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
@@ -1268,7 +1327,20 @@ else:
     st.caption("Con pocas operaciones, confirma con más trades antes de cambiar reglas.")
 
     st.markdown("### 🧠 Pistas rápidas (RR)")
-    if (rr_df["rr"] >= 1).mean() < 0.35:
+    pct_rr1 = (rr_df["rr"] >= 1).mean()
+    pct_stop = (rr_df["rr"] <= -1).mean()
+    pct_small_loss = ((rr_df["rr"] < 0) & (rr_df["rr"] > -0.5)).mean()
+
+    if pct_rr1 < 0.35:
+        st.warning("⚠️ Pocos trades llegan a RR≥1. Revisa: entrar tarde, SL muy grande, o TP demasiado corto.")
+    if pct_stop > 0.10:
+        st.warning("🚨 Muchas pérdidas de 1R o más (RR ≤ -1). Revisa: slippage, noticias, stops muy ajustados o entradas sin confirmación.")
+    if pct_small_loss < 0.05 and pct_stop > 0.15:
+        st.info("🟡 Casi no hay pérdidas pequeñas: cuando pierdes, sueles perder ~1R completo. Eso suele indicar 'stop-out' frecuente (poco margen para salir antes). Buen candidato: mejorar filtros de entrada/horario o invalidación temprana.")
+
+    if rr_df["rr"].median() > 0.3 and pct_rr1 > 0.45:
+        st.success("✅ Estructura de RR saludable (según esta muestra). Aun así: valida con más trades.")
+
         st.warning("⚠️ Pocos trades llegan a RR≥1. Revisa: entrar tarde, SL muy grande, o TP demasiado corto.")
     if (rr_df["rr"] <= -1).mean() > 0.10:
         st.warning("🚨 Muchas pérdidas de 1R o más (RR ≤ -1). Revisa: slippage, noticias, stops muy ajustados o entradas sin confirmación.")
@@ -1285,22 +1357,39 @@ else:
         c7.metric("Devolución mediana", f"{wingb.median()*100:.0f}%")
         c8.metric("Ganadores con datos", f"{len(wincap)}")
 
-        fig_cap = px.histogram(t[t["captura_pct"].notna()], x="captura_pct", nbins=25,
-                               title="Captura en ganadores (qué % del máximo flotante te quedas)")
-        fig_cap.add_vline(x=0.5, line_width=1, line_dash="dash")
+        # Mostrar en % (0–100). Si ves valores >100%, suele ser inconsistencia de log (maxUnreal no capturó el pico real).
+        raw_cap = t["captura_pct"].dropna()
+        n_weird = int((raw_cap > 1.05).sum())
+        if n_weird > 0:
+            st.warning("⚠️ Veo algunos valores de 'captura' > 100%. Eso suele pasar cuando maxUnreal no capturó el pico real (o por parciales). "
+                       "Para no confundir, el gráfico se limita a 0–100%.")
+
+        cap_plot = (raw_cap.clip(0, 1) * 100.0)
+        cap_df = pd.DataFrame({"Captura (%)": cap_plot})
+
+        fig_cap = px.histogram(
+            cap_df,
+            x="Captura (%)",
+            nbins=20,
+            title="Qué tan cerca del pico cierras (solo ganadores)",
+        )
+        fig_cap.add_vline(x=50, line_width=1, line_dash="dash")
         fig_cap.update_layout(height=300, margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig_cap, use_container_width=True)
 
         st.markdown("**Qué significa esto (en simple)**")
         st.write(
-            "Solo se calcula en trades **ganadores**. \n"
-            "- **Máximo flotante** = lo mejor que llegó a ir tu trade antes de cerrar (maxUnreal). \n"
-            "- **Captura** = qué % de ese máximo terminaste cobrando. \n"
-            "- **Devolución** = qué % devolviste desde el máximo hasta el cierre."
+            "Solo se calcula en trades **ganadores**. "
+            "La idea es responder: **¿cerré cerca del mejor punto, o dejé devolver mucho?**"
         )
         st.write(
-            "Ejemplo: el trade llegó a **+$500** (máximo flotante) pero cerró en **+$200** → "
-            "Captura = 200/500 = **40%** y Devolución = **60%**."
+            "- **Pico del trade** = el mejor PnL flotante que tuvo antes de cerrar (*maxUnreal*).\n"
+            "- **Te quedas (captura)** = qué % de ese pico terminaste cobrando al cerrar.\n"
+            "- **Devolviste (devolución)** = qué % retrocedió desde el pico hasta el cierre."
+        )
+        st.write(
+            "Ejemplo: el trade llegó a **+$500** (pico) y cerró en **+$475** → "
+            "Te quedas ≈ **95%** y devolviste ≈ **5%**."
         )
 
         st.markdown("**🧠 Consejos automáticos (salidas / trailing)**")
