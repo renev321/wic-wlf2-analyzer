@@ -1635,6 +1635,361 @@ else:
     st.caption("Regla de oro: prefiere horas con buen Score ponderado + buen PF + buena muestra, no solo winrate.")
 
 # ============================================================
+# ============================================================
+# Entradas por día y orden del trade (tuning realista)
+# ============================================================
+st.subheader("📅 Entradas por día y orden del trade")
+st.caption("Aquí miramos **cuántas entradas haces por día** y si el **trade #1 / #2 / #3...** suele ser mejor o peor. "
+           "Sirve para decisiones realistas como **MaxSetupsPerSession**, evitar el 'revenge trade' y cortar días malos.")
+
+if "entry_time" in t.columns and t["entry_time"].notna().any():
+    te = t.copy()
+    te = te[te["entry_time"].notna()].copy()
+    te = te.sort_values("entry_time").reset_index(drop=True)
+    te["entry_date"] = te["entry_time"].dt.date
+    te["entry_hour"] = te["entry_time"].dt.hour
+
+    # Trades por día
+    per_day = (te.groupby("entry_date", as_index=False)
+                 .agg(trades=("tradeRealized","size"),
+                      pnl=("tradeRealized","sum"),
+                      winrate=("tradeRealized", lambda s: float((s>0).mean()*100) if len(s) else np.nan)))
+    colA, colB, colC, colD = st.columns(4)
+    colA.metric("Promedio trades / día", f"{per_day['trades'].mean():.2f}" if len(per_day) else "N/A")
+    colB.metric("Máximo trades en un día", f"{int(per_day['trades'].max())}" if len(per_day) else "N/A")
+    colC.metric("Días con 3+ trades", f"{int((per_day['trades']>=3).sum())}" if len(per_day) else "0")
+    colD.metric("Días totales", f"{len(per_day)}")
+
+    c1, c2 = st.columns([1,1])
+    with c1:
+        fig = px.bar(per_day, x="entry_date", y="trades", title="Trades por día")
+        fig.update_layout(xaxis_title="Día", yaxis_title="Trades")
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        fig = px.scatter(per_day, x="trades", y="pnl",
+                         title="¿Más trades = mejor día? (PnL día vs # trades)",
+                         hover_data=["entry_date","winrate"])
+        fig.update_layout(xaxis_title="# trades del día", yaxis_title="PnL del día ($)")
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Orden del trade dentro del día
+    te["trade_num_day"] = te.groupby("entry_date").cumcount() + 1
+    te["orden_trade"] = te["trade_num_day"].apply(lambda n: "1º" if n==1 else ("2º" if n==2 else ("3º" if n==3 else "4º+")))
+
+    # Resumen por orden
+    def _pf(sub):
+        return profit_factor(sub) if len(sub) else np.nan
+
+    by_order = (te.groupby("orden_trade", as_index=False)
+                  .agg(trades=("tradeRealized","size"),
+                       pnl_prom=("tradeRealized","mean"),
+                       pnl_med=("tradeRealized","median"),
+                       winrate=("tradeRealized", lambda s: float((s>0).mean()*100) if len(s) else np.nan)))
+    # PF por orden
+    pf_map = {k:_pf(v) for k,v in te.groupby("orden_trade")}
+    by_order["pf"] = by_order["orden_trade"].map(pf_map)
+
+    # Orden de presentación
+    orden_cat = ["1º","2º","3º","4º+"]
+    by_order["orden_trade"] = pd.Categorical(by_order["orden_trade"], categories=orden_cat, ordered=True)
+    by_order = by_order.sort_values("orden_trade")
+
+    st.markdown("### 🔎 ¿Cuál trade del día suele ser el peor?")
+    st.write("Si ves que **#3 o #4+** baja fuerte (PF<1 o promedio<0), suele ser señal de **sobre-trading**.")
+    st.dataframe(by_order, use_container_width=True, hide_index=True)
+
+    fig = px.bar(by_order, x="orden_trade", y="pnl_prom", color="pnl_prom",
+                 color_continuous_scale="RdYlGn", color_continuous_midpoint=0,
+                 title="Promedio por trade según orden en el día")
+    fig.update_layout(xaxis_title="Orden del trade en el día", yaxis_title="Promedio PnL por trade ($)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig = px.bar(by_order, x="orden_trade", y="pf", color="pf",
+                 color_continuous_scale="RdYlGn", color_continuous_midpoint=1.0,
+                 title="Profit Factor según orden en el día")
+    fig.add_hline(y=1.0, line_dash="dash")
+    fig.update_layout(xaxis_title="Orden del trade en el día", yaxis_title="Profit Factor")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Heatmap: hora vs orden (promedio y conteo)
+    st.markdown("### 🕒 Hora de entrada vs orden del trade")
+    st.write("Útil para detectar cosas tipo: **'el 2º trade después de cierta hora es malo'**.")
+    tmp = te.copy()
+    tmp["h"] = tmp["entry_hour"].astype("Int64")
+    tmp["ord"] = tmp["orden_trade"].astype(str)
+    pivot_mean = tmp.pivot_table(index="ord", columns="h", values="tradeRealized", aggfunc="mean")
+    pivot_n = tmp.pivot_table(index="ord", columns="h", values="tradeRealized", aggfunc="size")
+
+    # Solo mostramos si hay algo
+    if pivot_mean.notna().sum().sum() > 0:
+        # Creamos texto como "avg\n(n=..)" para evitar confusión
+        text = pivot_mean.copy()
+        for r in text.index:
+            for c in text.columns:
+                a = pivot_mean.loc[r,c]
+                n = pivot_n.loc[r,c]
+                if pd.isna(a) or pd.isna(n) or n == 0:
+                    text.loc[r,c] = ""
+                else:
+                    text.loc[r,c] = f"{a:.0f}\n(n={int(n)})"
+        try:
+            fig = px.imshow(pivot_mean, color_continuous_scale="RdYlGn",
+                            color_continuous_midpoint=0, aspect="auto")
+            fig.update_traces(text=text, texttemplate="%{text}")
+            fig.update_layout(title="Heatmap (promedio PnL $) — texto muestra n", xaxis_title="Hora", yaxis_title="Orden trade")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            st.info("Tu versión de Plotly no soporta este heatmap con texto. (No afecta el análisis.)")
+    else:
+        st.info("No hay suficientes datos con hora de entrada para el heatmap.")
+else:
+    st.info("No hay entry_time en los datos (faltan logs ENTRY). Esta sección necesita ENTRY.")
+
+# ============================================================
+# 🧪 Lab: Simulador de reglas diarias y filtros (tuning realista)
+# ============================================================
+st.subheader("🧪 Lab: Simulador de reglas diarias y filtros")
+st.caption("Simula reglas reales: **MaxLoss/MaxProfit por día**, **máximo trades por día**, **racha de pérdidas**, y filtros (OR/EWO/ATR/Absorción/Actividad). "
+           "La simulación es 'what-if': te dice cómo habría cambiado tu curva con esas reglas.")
+
+def _apply_filters(base: pd.DataFrame):
+    df = base.copy()
+    notes = []
+
+    # Horario (por hora)
+    if "entry_time" in df.columns and df["entry_time"].notna().any():
+        df["entry_hour"] = df["entry_time"].dt.hour
+        all_hours = list(range(24))
+        horas_sel = st.multiselect("Horas permitidas (entrada)", options=all_hours, default=all_hours, help="Filtra por hora de ENTRADA.")
+        df = df[df["entry_hour"].isin(horas_sel)].copy()
+        notes.append(f"Horas: {len(horas_sel)}/24")
+    else:
+        horas_sel = None
+
+    # OR Size
+    if "orSize" in df.columns and df["orSize"].notna().any():
+        lo, hi = float(df["orSize"].quantile(0.05)), float(df["orSize"].quantile(0.95))
+        rng = st.slider("OR Size permitido", min_value=float(df["orSize"].min()), max_value=float(df["orSize"].max()),
+                        value=(lo, hi))
+        df = df[df["orSize"].between(rng[0], rng[1])].copy()
+        notes.append("OR Size")
+    # EWO
+    if "ewo" in df.columns and df["ewo"].notna().any():
+        eabs = df["ewo"].abs()
+        lo, hi = float(eabs.quantile(0.05)), float(eabs.quantile(0.95))
+        thr = st.slider("|EWO| mínimo", min_value=float(eabs.min()), max_value=float(eabs.max()), value=lo)
+        df = df[eabs >= thr].copy()
+        notes.append("|EWO|")
+    # ATR
+    if "atr" in df.columns and df["atr"].notna().any():
+        lo, hi = float(df["atr"].quantile(0.05)), float(df["atr"].quantile(0.95))
+        rng = st.slider("ATR permitido", min_value=float(df["atr"].min()), max_value=float(df["atr"].max()),
+                        value=(lo, hi))
+        df = df[df["atr"].between(rng[0], rng[1])].copy()
+        notes.append("ATR")
+    # Absorción
+    if "pre_absorcion" in df.columns and df["pre_absorcion"].notna().any():
+        max_abs = float(df["pre_absorcion"].quantile(0.95))
+        thr = st.slider("Absorción máxima (evitar absorción extrema)", min_value=float(df["pre_absorcion"].min()),
+                        max_value=float(df["pre_absorcion"].max()), value=max_abs)
+        df = df[df["pre_absorcion"] <= thr].copy()
+        notes.append("Absorción")
+    # Actividad
+    if "pre_actividad_rel" in df.columns and df["pre_actividad_rel"].notna().any():
+        # actividad puede ser negativa/0 en algunos casos; ponemos min razonable por percentil
+        min_act = float(df["pre_actividad_rel"].quantile(0.10))
+        thr = st.slider("Actividad mínima (volumen relativo antes de entrar)", min_value=float(df["pre_actividad_rel"].min()),
+                        max_value=float(df["pre_actividad_rel"].max()), value=min_act)
+        df = df[df["pre_actividad_rel"] >= thr].copy()
+        notes.append("Actividad")
+    # Sin apoyo (divergencia)
+    if "pre_sin_apoyo" in df.columns:
+        avoid = st.checkbox("Evitar 'sin apoyo' (presión vs avance en contra)", value=False)
+        if avoid:
+            df = df[~df["pre_sin_apoyo"].fillna(False)].copy()
+            notes.append("Evitar sin apoyo")
+
+    return df, notes
+
+def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, max_trades: int,
+                          max_consec_losses: int, stop_big_loss: bool, stop_big_win: bool):
+    if df is None or df.empty:
+        return df, pd.DataFrame()
+
+    sim = df.copy()
+    sim = sim[sim["entry_time"].notna()].copy() if "entry_time" in sim.columns else sim.copy()
+    sim = sim.sort_values("entry_time" if "entry_time" in sim.columns else "exit_time").reset_index()
+    sim["entry_date"] = (sim["entry_time"] if "entry_time" in sim.columns else sim["exit_time"]).dt.date
+
+    kept_rows = []
+    stops = []
+
+    for day, sub in sim.groupby("entry_date"):
+        sub = sub.sort_values("entry_time" if "entry_time" in sub.columns else "exit_time")
+        pnl_day = 0.0
+        consec = 0
+        taken = 0
+        halted = False
+        stop_reason = None
+
+        for _, row in sub.iterrows():
+            if halted:
+                break
+            if max_trades > 0 and taken >= max_trades:
+                halted = True
+                stop_reason = "Máx trades/día"
+                break
+            if max_loss > 0 and pnl_day <= -abs(max_loss):
+                halted = True
+                stop_reason = "Max pérdida/día"
+                break
+            if max_profit > 0 and pnl_day >= abs(max_profit):
+                halted = True
+                stop_reason = "Max ganancia/día"
+                break
+
+            # Ejecuta trade
+            kept_rows.append(int(row["index"]))
+            tr = float(row.get("tradeRealized", 0) or 0)
+            pnl_day += tr
+            taken += 1
+            if tr < 0:
+                consec += 1
+            else:
+                consec = 0
+
+            rr = row.get("rr", np.nan)
+            if stop_big_loss and rr is not None and not (isinstance(rr, float) and np.isnan(rr)):
+                if float(rr) <= -1.0:
+                    halted = True
+                    stop_reason = "Stop-out fuerte (≤ -1R)"
+            if (not halted) and stop_big_win and rr is not None and not (isinstance(rr, float) and np.isnan(rr)):
+                if float(rr) >= 2.0:
+                    halted = True
+                    stop_reason = "Cierre tras ganador grande (≥ 2R)"
+            if (not halted) and max_consec_losses > 0 and consec >= max_consec_losses:
+                halted = True
+                stop_reason = f"{max_consec_losses} pérdidas seguidas"
+            if (not halted) and max_loss > 0 and pnl_day <= -abs(max_loss):
+                halted = True
+                stop_reason = "Max pérdida/día"
+            if (not halted) and max_profit > 0 and pnl_day >= abs(max_profit):
+                halted = True
+                stop_reason = "Max ganancia/día"
+
+        if stop_reason is not None:
+            stops.append({
+                "fecha": day,
+                "motivo": stop_reason,
+                "pnl_hasta_stop": pnl_day,
+                "trades_ejecutados": taken,
+                "trades_totales_dia": int(len(sub)),
+                "trades_filtrados_por_stop": int(max(0, len(sub) - taken))
+            })
+
+    kept = df.loc[kept_rows].copy()
+    stops_df = pd.DataFrame(stops)
+    return kept, stops_df
+
+# Inputs del Lab
+lab_left, lab_right = st.columns([1,1])
+
+with lab_left:
+    st.markdown("**Reglas diarias**")
+    max_loss = st.number_input("Max pérdida por día ($)", min_value=0.0, value=600.0, step=50.0,
+                               help="Si el día llega a -MaxLoss, se corta el trading del día.")
+    max_profit = st.number_input("Max ganancia por día ($)", min_value=0.0, value=4500.0, step=100.0,
+                                 help="Si el día llega a +MaxProfit, se corta el trading del día.")
+    max_trades = st.slider("Máx trades por día (0 = sin límite)", min_value=0, max_value=10, value=3)
+    max_consec = st.slider("Máx pérdidas seguidas (0 = sin límite)", min_value=0, max_value=5, value=2)
+    stop_big_loss = st.checkbox("Cortar el día tras un stop-out fuerte (RR ≤ -1)", value=False)
+    stop_big_win = st.checkbox("Cortar el día tras un ganador grande (RR ≥ 2)", value=False)
+
+with lab_right:
+    st.markdown("**Filtros de entrada (opcional)**")
+    base_for_lab = t.copy()
+    base_for_lab = base_for_lab[base_for_lab["entry_time"].notna()].copy() if "entry_time" in base_for_lab.columns else base_for_lab
+    filtered, filter_notes = _apply_filters(base_for_lab)
+    st.write(f"Trades tras filtros: **{len(filtered)}** (de {len(base_for_lab)})")
+    if filter_notes:
+        st.caption("Filtros activos: " + ", ".join(filter_notes))
+
+# Simulación
+if filtered is None or filtered.empty:
+    st.info("Con los filtros actuales no quedan trades para simular.")
+else:
+    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec, stop_big_loss, stop_big_win)
+
+    # Comparativa: base filtrada vs simulado (reglas)
+    st.markdown("### 📊 Resultados del Lab (base filtrada vs simulado)")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    base_pf = profit_factor(filtered) if len(filtered) else np.nan
+    sim_pf = profit_factor(sim_kept) if len(sim_kept) else np.nan
+
+    c1.metric("Trades (base)", f"{len(filtered)}")
+    c2.metric("Trades (sim)", f"{len(sim_kept)}", delta=f"{len(sim_kept)-len(filtered)}")
+    c3.metric("PnL total base ($)", f"{filtered['tradeRealized'].sum():.0f}")
+    c4.metric("PnL total sim ($)", f"{sim_kept['tradeRealized'].sum():.0f}", delta=f"{(sim_kept['tradeRealized'].sum()-filtered['tradeRealized'].sum()):.0f}")
+    c5.metric("PF base / sim", f"{fmt(base_pf,2)} / {fmt(sim_pf,2)}")
+
+    # Drawdown
+    def _equity_df(df_):
+        z = df_.copy()
+        z = z.sort_values("exit_time" if "exit_time" in z.columns else "entry_time")
+        z["equity"] = z["tradeRealized"].fillna(0).cumsum()
+        z["equity_peak"] = z["equity"].cummax()
+        z["drawdown"] = z["equity"] - z["equity_peak"]
+        return z
+
+    base_eq = _equity_df(filtered)
+    sim_eq = _equity_df(sim_kept)
+
+    dd_base = float(base_eq["drawdown"].min()) if len(base_eq) else np.nan
+    dd_sim = float(sim_eq["drawdown"].min()) if len(sim_eq) else np.nan
+    colx, coly, colz = st.columns(3)
+    colx.metric("Max DD base ($)", f"{dd_base:.0f}" if not np.isnan(dd_base) else "N/A")
+    coly.metric("Max DD sim ($)", f"{dd_sim:.0f}" if not np.isnan(dd_sim) else "N/A", delta=f"{(dd_sim-dd_base):.0f}" if (not np.isnan(dd_sim) and not np.isnan(dd_base)) else None)
+    colz.metric("Días cortados (reglas)", f"{len(stops_df)}")
+
+    # Equity curve
+    st.markdown("#### Curva de equity (base vs simulado)")
+    # Alineamos por índice temporal (exit_time)
+    base_plot = base_eq[["exit_time","equity"]].rename(columns={"equity":"Equity base"})
+    sim_plot = sim_eq[["exit_time","equity"]].rename(columns={"equity":"Equity sim"})
+    plot_df = pd.merge_asof(base_plot.sort_values("exit_time"),
+                            sim_plot.sort_values("exit_time"),
+                            on="exit_time", direction="nearest", tolerance=pd.Timedelta("1D"))
+    plot_df = plot_df.sort_values("exit_time")
+    fig = px.line(plot_df, x="exit_time", y=["Equity base","Equity sim"], title="Equity ($)")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # Stop reasons
+    if stops_df is not None and not stops_df.empty:
+        st.markdown("#### ¿Por qué se cortó el día?")
+        st.dataframe(stops_df.sort_values(["fecha"]), use_container_width=True, hide_index=True)
+        fig = px.bar(stops_df.groupby("motivo", as_index=False).size(),
+                     x="motivo", y="size", title="Frecuencia de motivos de corte")
+        fig.update_layout(xaxis_title="Motivo", yaxis_title="Días")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Con estas reglas, no se activó ningún 'corte del día'.")
+
+    # Consejos automáticos del Lab
+    st.markdown("### 💡 Consejos automáticos (Lab)")
+    if len(filtered) < 30:
+        st.warning("Muestra pequeña tras filtros: toma estas conclusiones como hipótesis, no como regla.")
+    if len(sim_kept) < max(10, int(0.25*len(filtered))):
+        st.warning("La simulación está eliminando demasiados trades. Revisa si estás filtrando/cortando en exceso.")
+
+    if (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim < dd_base:
+        st.success("✅ Menor drawdown con reglas: buen candidato para un 'Daily Guard' realista.")
+    if (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim > dd_base:
+        st.warning("⚠️ Drawdown empeoró en la simulación: estas reglas podrían estar cortando recuperación o dejando pérdidas grandes.")
+
+    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf > base_pf + 0.2 and (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim > dd_base:
+        st.info("Mejoró PF pero empeoró DD: típico cuando eliminas muchos trades pequeños pero te quedas con pérdidas grandes. Revisa filtros/horarios.")
+    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf < base_pf and (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim < dd_base:
+        st.info("Bajó PF pero también bajó el DD: a veces vale la pena si tu objetivo es estabilidad (menos estrés / menos reset).")
 # Resumen final (muy user-friendly)
 # ============================================================
 st.subheader("🧾 Resumen final y recomendaciones")
