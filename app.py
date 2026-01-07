@@ -739,16 +739,35 @@ def plot_factor_bins(df_known: pd.DataFrame, col: str, q: int, min_trades: int, 
     tbl_chart = tbl[tbl["Trades"] >= min_trades].copy()
 
     if not tbl_chart.empty:
-        fig_exp = px.bar(tbl_chart, x="Grupo", y="Promedio por trade", title=f"{title} → Promedio por trade (rangos)")
-        fig_exp.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+        # Promedio por trade: escala divergente centrada en 0 (azul=negativo, rojo=positivo)
+        fig_exp = px.bar(
+            tbl_chart,
+            x="Grupo",
+            y="Promedio por trade",
+            color="Promedio por trade",
+            color_continuous_scale="RdBu_r",
+            title=f"{title} → Promedio por trade (rangos)",
+            text_auto=True,
+        )
+        fig_exp.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10), coloraxis_colorbar_title="Promedio")
         fig_exp.add_hline(y=0, line_width=1, line_dash="dash")
 
-        fig_pf = px.bar(tbl_chart, x="Grupo", y="Profit Factor", title=f"{title} → Profit Factor (rangos)")
-        fig_pf.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
+        # Profit Factor: rojo=bajo, verde=alto
+        fig_pf = px.bar(
+            tbl_chart,
+            x="Grupo",
+            y="Profit Factor",
+            color="Profit Factor",
+            color_continuous_scale="RdYlGn",
+            title=f"{title} → Profit Factor (rangos)",
+            text_auto=True,
+        )
+        fig_pf.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10), coloraxis_colorbar_title="PF")
         fig_pf.add_hline(y=1.0, line_width=1, line_dash="dash")
 
         st.plotly_chart(fig_exp, use_container_width=True)
         st.plotly_chart(fig_pf, use_container_width=True)
+        st.caption("Profit Factor (PF) = Ganancias totales / Pérdidas totales. PF>1 indica que el conjunto gana; PF>1.5 suele ser muy sólido (con muestra suficiente).")
 
         advice_from_table(tbl_chart, title=title, min_trades=min_trades)
     else:
@@ -810,14 +829,34 @@ def plot_heatmap_weekday_hour(t: pd.DataFrame, min_trades: int):
     agg.loc[agg["Trades"] < min_trades, "Promedio"] = np.nan
     pivot = agg.pivot(index="weekday_order", columns="exit_hour", values="Promedio")
 
+    # Si con el mínimo actual no queda nada visible, avisamos y no dibujamos un heatmap vacío.
+    if pivot.count().sum() == 0:
+        st.info(
+            f"No hay celdas con ≥ {min_trades} trades para el heatmap. "
+            "Baja el mínimo o usa el panel por hora (arriba), que requiere menos muestra."
+        )
+        return
+
+    # Escala azul→rojo (negativo→positivo). Centramos en 0 para lectura rápida.
+    vals = pivot.values.astype(float)
+    max_abs = np.nanmax(np.abs(vals)) if np.isfinite(vals).any() else None
+    zmin = -max_abs if max_abs else None
+    zmax = max_abs if max_abs else None
+
     fig = px.imshow(
         pivot,
         aspect="auto",
         title=f"Heatmap: Promedio por trade (Día x Hora) | solo celdas con ≥ {min_trades} trades",
-        origin="lower"
+        origin="lower",
+        color_continuous_scale="RdBu_r",
+        zmin=zmin,
+        zmax=zmax,
+        zmid=0,
+        text_auto=True,
     )
-    fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
+    fig.update_layout(height=460, margin=dict(l=10, r=10, t=60, b=10))
     st.plotly_chart(fig, use_container_width=True)
+    st.caption("Azul = promedio negativo, rojo = promedio positivo. Si casi todo queda vacío, baja el mínimo (muestra pequeña).")
     st.caption("Lectura: celdas positivas = mejor promedio/trade. Vacías = poca muestra (no concluyente).")
 
 
@@ -897,6 +936,22 @@ with st.expander("📌 Cómo leer estas métricas (simple)"):
     st.write("**Drawdown**: la peor caída desde el máximo de tu equity; representa el “dolor máximo” del sistema.")
     st.write("**Rachas**: cuántas operaciones ganadas/perdidas seguidas (útil para guardias diarias y sizing).")
 
+st.markdown("### ⚙️ Avisos según tus ajustes")
+total_n = int(summary.get("n", 0))
+if total_n < 60:
+    st.info("Muestra pequeña (menos de 60 trades). Úsalo para orientar el tuning, pero evita cambiar reglas por 3 trades.")
+
+# Si el usuario pide demasiados rangos o mínimos para la muestra, casi todo quedará vacío.
+if q_bins * max(1, min_trades) > max(1, total_n):
+    st.warning(
+        "⚠️ Con estos ajustes vas a ver muchos paneles vacíos: estás pidiendo demasiados rangos o un mínimo demasiado alto para tu muestra. "
+        "Sugerencia con esta cantidad de trades: 3–5 rangos y mínimo 10–20 trades por grupo."
+    )
+if min_trades > max(10, total_n // 2):
+    st.warning("⚠️ Mínimo por grupo muy alto vs tu total de trades. Baja el mínimo si quieres ver más comparaciones (con cuidado).")
+if recommended_trades > total_n:
+    st.info("Recomendación: tu 'trades recomendados para decidir' es mayor que tu muestra actual, así que todas las conclusiones son provisionales.")
+
 # ============================================================
 # Main charts
 # ============================================================
@@ -970,6 +1025,17 @@ else:
     fig_rr.update_layout(height=320, margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig_rr, use_container_width=True)
 
+    st.markdown("**Cómo leer RR (rápido)**")
+    rr_med = rr_df["rr"].median()
+    rr_mean = rr_df["rr"].mean()
+    if rr_mean > 0 and rr_med < 0:
+        st.info("Promedio > 0 y mediana < 0: el resultado depende de pocos trades grandes; la mayoría pierde.")
+    elif rr_mean > 0 and rr_med > 0:
+        st.info("Promedio > 0 y mediana > 0: la mayoría de trades aporta; comportamiento más estable.")
+    elif rr_mean < 0:
+        st.info("Promedio < 0: el sistema está perdiendo (tuning o filtros urgentes).")
+    st.caption("Con pocas operaciones, confirma con más trades antes de cambiar reglas.")
+
     st.markdown("### 🧠 Pistas rápidas (RR)")
     if (rr_df["rr"] >= 1).mean() < 0.35:
         st.warning("⚠️ Pocos trades llegan a RR≥1. Revisa: entrar tarde, SL muy grande, o TP demasiado corto.")
@@ -994,7 +1060,37 @@ else:
         fig_cap.update_layout(height=300, margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(fig_cap, use_container_width=True)
 
-        st.caption("Captura alta = buen manejo. Devolución alta = dejaste mucho en la mesa (TP/TS tarde).")
+        st.markdown("**Qué significa esto (en simple)**")
+        st.write(
+            "Solo se calcula en trades **ganadores**. \n"
+            "- **Máximo flotante** = lo mejor que llegó a ir tu trade antes de cerrar (maxUnreal). \n"
+            "- **Captura** = qué % de ese máximo terminaste cobrando. \n"
+            "- **Devolución** = qué % devolviste desde el máximo hasta el cierre."
+        )
+        st.write(
+            "Ejemplo: el trade llegó a **+$500** (máximo flotante) pero cerró en **+$200** → "
+            "Captura = 200/500 = **40%** y Devolución = **60%**."
+        )
+
+        st.markdown("**🧠 Consejos automáticos (salidas / trailing)**")
+        cap_med = wincap.median() if not wincap.empty else np.nan
+        gb_med = wingb.median() if not wingb.empty else np.nan
+
+        if cap_med == cap_med and cap_med < 0.35:
+            st.warning("⚠️ Captura mediana baja (<35%). Estás cerrando muy lejos del mejor punto: revisa trailing, TP, o reglas de salida temprana.")
+        elif cap_med == cap_med and cap_med > 0.60:
+            st.success("✅ Captura mediana alta (>60%). Buen manejo de salida (en esta muestra).")
+        else:
+            st.info("🟡 Captura mediana intermedia. Puede estar bien; valida con más trades.")
+
+        if gb_med == gb_med and gb_med > 0.60:
+            st.warning("⚠️ Devolución mediana alta (>60%). Estás devolviendo mucho: prueba trailing más agresivo o TP parcial mejor definido.")
+        elif gb_med == gb_med and gb_med < 0.35:
+            st.success("✅ Devolución mediana baja (<35%). Sueles proteger ganancias a tiempo.")
+        else:
+            st.info("🟡 Devolución mediana intermedia. Ajusta solo si ves que afecta RR/expectancia.")
+
+        st.caption("Interpretación rápida: Captura alta suele indicar salidas eficientes; Devolución alta suele indicar trailing/TP tarde o dejar correr sin proteger.")
 
     # RR por plantilla / tipo de orden
     split_cols = []
@@ -1080,18 +1176,33 @@ else:
     tab1, tab2, tab3, tab4, tab5 = st.tabs(["OR Size", "ATR", "EWO", "Balance C/V", "Presión y Actividad"])
 
     with tab1:
+        with st.expander("📌 OR Size: qué significa y cómo usarlo"):
+            st.write("OR Size = tamaño del rango inicial (Opening Range).")
+            st.write("- OR grande → mercado más 'movido'. Si tu PF cae aquí, suele ser por whipsaws y entradas tardías.")
+            st.write("- OR pequeño → mercado más 'apretado'. Si tu PF cae aquí, suele ser por falta de recorrido.")
+            st.write("Consejo: busca rangos con **PF>1**, **promedio > 0** y muestra 🟢 antes de convertirlo en filtro.")
         if "orSize" in df_known.columns and df_known["orSize"].notna().sum() > 30:
             plot_factor_bins(df_known, "orSize", q_bins, min_trades, recommended_trades, "OR Size (tamaño del rango)", show_adv_scatter, df_scatter)
         else:
             st.info("No hay suficientes valores de OR Size en los logs.")
 
     with tab2:
+        with st.expander("📌 ATR: qué significa y cómo usarlo"):
+            st.write("ATR = volatilidad (cuánto se mueve el precio en promedio).")
+            st.write("- ATR alto → movimientos amplios: necesitas stops/targets coherentes o te saca el ruido.")
+            st.write("- ATR bajo → poco recorrido: si tu TP es fijo, puede que no llegue.")
+            st.write("Consejo: si tu estrategia tiene ATR engine, aquí verás si te está ayudando o empeorando.")
         if "atr" in df_known.columns and df_known["atr"].notna().sum() > 30:
             plot_factor_bins(df_known, "atr", q_bins, min_trades, recommended_trades, "ATR (volatilidad)", show_adv_scatter, df_scatter)
         else:
             st.info("No hay suficientes valores de ATR en los logs.")
 
     with tab3:
+        with st.expander("📌 EWO: qué significa y cómo usarlo"):
+            st.write("EWO (aquí usamos |EWO|) = fuerza de tendencia. Más alto suele implicar tendencia más marcada.")
+            st.write("- |EWO| alto → tendencia: suele favorecer continuaciones/breakouts.")
+            st.write("- |EWO| bajo → chop/rango: suele castigar entradas por impulso.")
+            st.write("Consejo: si ves PF<1 en |EWO| bajo, es un buen candidato a filtro de 'no-trade'.")
         if "ewo" in df_known.columns and df_known["ewo"].notna().sum() > 30:
             df_known2 = df_known.copy()
             df_known2["ewo_abs"] = df_known2["ewo"].abs()
@@ -1104,6 +1215,11 @@ else:
             st.info("No hay suficientes valores de EWO en los logs.")
 
     with tab4:
+        with st.expander("📌 Balance comprador-vendedor: qué significa y cómo usarlo"):
+            st.write("Balance C/V = delta/vol (intensidad neta de compras vs ventas).")
+            st.write("- Valores altos (en magnitud) → desequilibrio fuerte (posible impulso).")
+            st.write("- Cerca de 0 → poca ventaja de flujo (más fácil que el precio se 'devuelva').")
+            st.write("Consejo: úsalo para evitar entradas cuando no hay participación real.")
         if "deltaRatio" in df_known.columns and df_known["deltaRatio"].notna().sum() > 30:
             plot_factor_bins(df_known, "deltaRatio", q_bins, min_trades, recommended_trades, "Balance comprador-vendedor (delta/vol)", show_adv_scatter, df_scatter)
         else:
@@ -1197,6 +1313,73 @@ else:
         st.warning(f"🚫 Hora candidata a evitar: **{worst['Grupo']}** (PF < 1 y promedio bajo).")
 
     st.caption("Regla de oro: prefiere horas con buen Score ponderado + buen PF + buena muestra, no solo winrate.")
+
+# ============================================================
+# Resumen final (muy user-friendly)
+# ============================================================
+st.subheader("🧾 Resumen final y recomendaciones")
+
+st.write(
+    "Este bloque resume lo más accionable. No es una verdad absoluta: con muestra pequeña, úsalo para orientar, no para 'sobre-optimizar'."
+)
+
+# 1) Salud general
+pf_val = summary.get("pf", np.nan)
+exp_val = summary.get("expectancy", np.nan)
+if pf_val == pf_val and pf_val < 1.0:
+    st.error("🚨 Salud general: Profit Factor < 1 (pierde). Prioridad: filtrar condiciones malas antes de ajustar targets.")
+elif exp_val == exp_val and exp_val < 0:
+    st.warning("⚠️ Salud general: promedio por trade < 0. Revisa filtros (horario/volatilidad/tendencia) y disciplina de salida.")
+else:
+    st.success("✅ Salud general: no se ve rojo inmediato (según esta muestra). Ahora toca mejorar consistencia.")
+
+# 2) RR y estructura
+if "rr" in t.columns and t["rr"].notna().any():
+    _rr = t[t["rr"].notna()]["rr"].astype(float)
+    rr_median = float(_rr.median())
+    rr_mean = float(_rr.mean())
+    rr_ge2 = float((_rr >= 2).mean() * 100)
+    rr_le_1 = float((_rr <= -1).mean() * 100)
+
+    st.markdown("**Estructura RR**")
+    st.write(f"- RR mediana: {rr_median:.2f} | RR promedio: {rr_mean:.2f} | %RR≥2: {rr_ge2:.1f}% | %RR≤-1: {rr_le_1:.1f}%")
+    if rr_mean > 0 and rr_median < 0:
+        st.info("Promedio > 0 y mediana < 0: dependes de pocos ganadores grandes. Enfócate en reducir stop-outs feos sin matar tus runners.")
+    if rr_le_1 > 15:
+        st.warning("⚠️ %RR≤-1 alto: estás tomando muchas pérdidas completas. Buen objetivo: mejorar confirmación/evitar chop/horas malas.")
+
+# 3) Manejo de ganadores (captura/devolución)
+if "captura_pct" in t.columns and t["captura_pct"].notna().sum() >= 5:
+    cap_med = float(t["captura_pct"].dropna().median())
+    gb_med = float(t["devolucion_pct"].dropna().median()) if "devolucion_pct" in t.columns and t["devolucion_pct"].notna().any() else np.nan
+    st.markdown("**Manejo de ganadores**")
+    st.write(f"- Captura mediana: {cap_med*100:.0f}%" + (f" | Devolución mediana: {gb_med*100:.0f}%" if gb_med == gb_med else ""))
+    if cap_med < 0.35:
+        st.warning("⚠️ Captura baja: estás dejando mucho en la mesa. Ajusta trailing/TP parcial o reglas de salida temprana.")
+    if gb_med == gb_med and gb_med > 0.60:
+        st.warning("⚠️ Devolución alta: el trade va bien, pero no proteges a tiempo. Prueba trailing más agresivo cuando ya estés en +1R.")
+
+# 4) Motivos de salida (top problema)
+if "exitReason" in t.columns and t["exitReason"].notna().any():
+    _tbl = group_metrics(t, "exitReason", min_trades=max(5, min_trades//2), recommended_trades=recommended_trades)
+    if not _tbl.empty:
+        worst = _tbl.sort_values("Promedio por trade").iloc[0]
+        if float(worst["Promedio por trade"]) < 0:
+            st.markdown("**Motivo de salida a vigilar**")
+            st.write(f"- {worst['Grupo']}: promedio {float(worst['Promedio por trade']):.1f} con {int(worst['Trades'])} trades")
+
+# 5) Horarios (si hay)
+if hour_tbl is not None and not hour_tbl.empty:
+    best = hour_tbl.iloc[0]
+    st.markdown("**Horario con mejor Score (ponderado)**")
+    st.write(f"- {best['Grupo']} | Trades={int(best['Trades'])} | PF={float(best['Profit Factor']):.2f} | Promedio={float(best['Promedio por trade']):.1f}")
+    if int(best["Trades"]) < min_trades * 2:
+        st.info("Nota: el mejor horario aún tiene poca muestra. Confirma con más meses antes de convertirlo en regla.")
+
+st.markdown("**Siguientes pasos recomendados (orden)**")
+st.write("1) Primero elimina lo rojo: horarios peores + condiciones con PF<1 (muestra 🟢).")
+st.write("2) Luego ajusta manejo: reduce devoluciones grandes y evita stop-outs completos recurrentes.")
+st.write("3) Al final optimiza targets/trailing: no mates los winners grandes si tu edge depende de ellos.")
 
 # ============================================================
 # Trades table
