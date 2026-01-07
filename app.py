@@ -663,24 +663,17 @@ if missing_entry > 0:
 
 # Sidebar controls
 st.sidebar.subheader("⚙️ Ajustes")
+min_trades = st.sidebar.slider("Mínimo trades por grupo (confiable)", 5, 120, 30, 5)
+q_bins = st.sidebar.slider("Número de rangos (bins por cuantiles)", 3, 12, 5, 1)
 
-simple_mode = st.sidebar.toggle("Modo simple (recomendado)", value=True)
-
-min_trades = st.sidebar.slider("Mín trades para mostrar bins", 5, 200, 30, 5)
-q_bins = st.sidebar.slider("Cantidad de bins (cuantiles)", 3, 20, 8, 1)
-
-if simple_mode:
-    show_adv_scatter = False
-    trend_mode = "Ninguna"
-    lowess_frac = 0.25
-    last_n_scatter = 0
-    show_time_analysis = False
-else:
-    show_adv_scatter = st.sidebar.checkbox("Mostrar scatter avanzado", value=True)
-    trend_mode = st.sidebar.selectbox("Línea de tendencia", ["Ninguna", "Lineal", "LOWESS"], index=0)
-    lowess_frac = st.sidebar.slider("LOWESS frac (solo si aplica)", 0.05, 0.8, 0.25, 0.05)
-    last_n_scatter = st.sidebar.slider("Últimos N trades (0 = todos)", 0, 2000, 0, 50)
-    show_time_analysis = st.sidebar.checkbox("Mostrar análisis por hora/día (heatmap)", value=False)
+show_adv_scatter = st.sidebar.checkbox("Mostrar scatters (modo avanzado)", value=True)
+trend_mode = st.sidebar.selectbox(
+    "Línea de tendencia (scatter)",
+    ["Ninguna", "Regresión (OLS)", "Suavizado (LOWESS)"],
+    index=1
+)
+lowess_frac = st.sidebar.slider("LOWESS suavidad (solo si LOWESS)", 0.05, 0.60, 0.25, 0.05)
+last_n_scatter = st.sidebar.slider("Scatters: últimos N trades (0=todo)", 0, 3000, 800, 100)
 
 summary = summarize(t)
 
@@ -748,44 +741,6 @@ for s in pnl_shape_insights(t):
         st.info(s)
 
 # ============================================================
-
-
-# Simple, high-signal charts (better for non-advanced users)
-st.markdown("### 🎯 Motivo de salida (ExitReason)")
-exit_stats = (
-    t.groupby("exitReason", dropna=False)
-     .agg(trades=("tradeRealized", "size"),
-          pnl=("tradeRealized", "sum"),
-          avg=("tradeRealized", "mean"))
-     .reset_index()
-     .sort_values("pnl", ascending=False)
-)
-fig_exit = px.bar(exit_stats, x="exitReason", y="pnl", hover_data=["trades", "avg"], title=None)
-st.plotly_chart(fig_exit, use_container_width=True)
-
-st.markdown("### 📅 PnL diario")
-daily = t.copy()
-daily["exit_date"] = pd.to_datetime(daily["exit_ts"]).dt.date
-daily_tbl = (
-    daily.groupby("exit_date", as_index=False)
-         .agg(pnl=("tradeRealized", "sum"), trades=("tradeRealized", "size"))
-         .sort_values("exit_date")
-)
-fig_daily = px.bar(daily_tbl, x="exit_date", y="pnl", hover_data=["trades"], title=None)
-st.plotly_chart(fig_daily, use_container_width=True)
-
-st.markdown("### 🧲 Riesgo vs potencial (MAE vs MFE)")
-rm = t.copy()
-rm["MAE"] = np.where(rm["minUnreal"] < 0, -rm["minUnreal"], 0.0)
-rm["MFE"] = np.where(rm["maxUnreal"] > 0, rm["maxUnreal"], 0.0)
-rm["Eficiencia"] = np.where(rm["MFE"] > 0, rm["tradeRealized"] / rm["MFE"], np.nan)
-fig_mae = px.scatter(
-    rm, x="MAE", y="MFE",
-    hover_data=["atmId", "dir", "exitReason", "tradeRealized", "Eficiencia"],
-    title=None
-)
-st.plotly_chart(fig_mae, use_container_width=True)
-st.caption("MAE = lo peor que fue el trade antes de salir (adverso). MFE = lo mejor que fue (favorable). Ideal: MAE bajo y MFE alto.")
 # Long vs Short
 # ============================================================
 st.subheader("🧭 Compra vs Venta (solo donde hay ENTRY)")
@@ -854,34 +809,32 @@ else:
 
 # ============================================================
 # Hours
-if show_time_analysis:
-    # ============================================================
-    st.subheader("⏰ Horarios (justo y confiable)")
+# ============================================================
+st.subheader("⏰ Horarios (justo y confiable)")
 
-    hour_tbl = plot_hour_analysis(t, min_trades=min_trades)
-    plot_heatmap_weekday_hour(t, min_trades=min_trades)
+hour_tbl = plot_hour_analysis(t, min_trades=min_trades)
+plot_heatmap_weekday_hour(t, min_trades=min_trades)
 
-    st.markdown("### 🧠 Consejos automáticos (Horarios)")
-    if hour_tbl is None or hour_tbl.empty:
-        st.info("No hay datos suficientes por hora con el mínimo configurado.")
-    else:
-        best = hour_tbl.iloc[0]
-        worst = hour_tbl.iloc[-1]
+st.markdown("### 🧠 Consejos automáticos (Horarios)")
+if hour_tbl is None or hour_tbl.empty:
+    st.info("No hay datos suficientes por hora con el mínimo configurado.")
+else:
+    best = hour_tbl.iloc[0]
+    worst = hour_tbl.iloc[-1]
 
-        st.info(
-            f"🏆 Hora recomendada: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
-            f"{traffic_pf(best['Profit Factor'])} | {traffic_exp(best['Promedio por trade'])}"
-        )
-        if best["Trades"] < min_trades * 2:
-            st.warning("⚠️ La mejor hora aún tiene muestra pequeña. Confirma con más logs.")
+    st.info(
+        f"🏆 Hora recomendada: **{best['Grupo']}** | Trades={int(best['Trades'])} | "
+        f"{traffic_pf(best['Profit Factor'])} | {traffic_exp(best['Promedio por trade'])}"
+    )
+    if best["Trades"] < min_trades * 2:
+        st.warning("⚠️ La mejor hora aún tiene muestra pequeña. Confirma con más logs.")
 
-        if not np.isnan(worst["Profit Factor"]) and worst["Profit Factor"] < 1.0:
-            st.warning(f"🚫 Hora candidata a evitar: **{worst['Grupo']}** (PF < 1 y promedio bajo).")
+    if not np.isnan(worst["Profit Factor"]) and worst["Profit Factor"] < 1.0:
+        st.warning(f"🚫 Hora candidata a evitar: **{worst['Grupo']}** (PF < 1 y promedio bajo).")
 
-        st.caption("Regla de oro: prefiere horas con buen Score ponderado + buen PF + buena muestra, no solo winrate.")
+    st.caption("Regla de oro: prefiere horas con buen Score ponderado + buen PF + buena muestra, no solo winrate.")
 
-    # ============================================================
-
+# ============================================================
 # Trades table
 # ============================================================
 with st.expander("📄 Tabla de trades (una fila por atmId)", expanded=False):
