@@ -219,6 +219,12 @@ def pair_trades(df: pd.DataFrame) -> pd.DataFrame:
     else:
         t["lado"] = "Sin datos (faltó ENTRY)"
 
+    # Backward-compat aliases (older code may expect *_ts)
+    if "exit_time" in t.columns and "exit_ts" not in t.columns:
+        t["exit_ts"] = t["exit_time"]
+    if "entry_time" in t.columns and "entry_ts" not in t.columns:
+        t["entry_ts"] = t["entry_time"]
+
     return t
 
 
@@ -669,8 +675,8 @@ q_bins = st.sidebar.slider("Número de rangos (bins por cuantiles)", 3, 12, 5, 1
 show_adv_scatter = st.sidebar.checkbox("Mostrar scatters (modo avanzado)", value=True)
 trend_mode = st.sidebar.selectbox(
     "Línea de tendencia (scatter)",
-    ["Ninguna", "Regresión (OLS)", "Suavizado (LOWESS)"],
-    index=1
+    ["Ninguna", "Suavizado (LOWESS)"],
+    index=0
 )
 lowess_frac = st.sidebar.slider("LOWESS suavidad (solo si LOWESS)", 0.05, 0.60, 0.25, 0.05)
 last_n_scatter = st.sidebar.slider("Scatters: últimos N trades (0=todo)", 0, 3000, 800, 100)
