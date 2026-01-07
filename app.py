@@ -2039,17 +2039,141 @@ else:
     fig = px.line(plot_df, x="exit_time", y=["Equity base","Equity sim"], title="Equity ($)")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Stop reasons
+    # Impacto de las reglas (en vez de solo frecuencia)
     if stops_df is not None and not stops_df.empty:
-        st.markdown("#### ¿Por qué se cortó el día?")
-        st.dataframe(stops_df.sort_values(["fecha"]), use_container_width=True, hide_index=True)
-        fig = px.bar(stops_df.groupby("motivo", as_index=False).size(),
-                     x="motivo", y="size", title="Frecuencia de motivos de corte")
-        fig.update_layout(xaxis_title="Motivo", yaxis_title="Días")
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("#### ¿Qué regla detuvo el día y qué impacto tuvo?")
+
+        # Construimos, por día, la secuencia de PnL en el orden real de entrada
+        _lab_base = filtered.copy()
+        _time_col = "entry_time" if "entry_time" in _lab_base.columns else "exit_time"
+        _lab_base = _lab_base[_lab_base[_time_col].notna()].copy()
+        _lab_base = _lab_base.sort_values(_time_col)
+        _lab_base["lab_day"] = _lab_base[_time_col].dt.date
+
+        def _day_dd_mag(pnls):
+            if pnls is None or len(pnls) == 0:
+                return 0.0
+            c = np.cumsum(pnls)
+            peak = np.maximum.accumulate(c)
+            dd = c - peak
+            return float(abs(np.min(dd))) if len(dd) else 0.0
+
+        day_to_pnls = {}
+        for d, subd in _lab_base.groupby("lab_day"):
+            pnls = subd["tradeRealized"].fillna(0).astype(float).tolist()
+            day_to_pnls[d] = pnls
+
+        enriched = stops_df.copy()
+
+        # Enriquecemos con "qué PnL quedó fuera" y "mejora de DD intradía" (aprox)
+        pnl_total_base = []
+        pnl_omitido = []
+        delta_pnl = []
+        dd_day_base = []
+        dd_day_sim = []
+        delta_dd = []
+        stop_ahorra = []
+
+        for _, r in enriched.iterrows():
+            d = r["fecha"]
+            taken = int(r.get("trades_ejecutados", 0) or 0)
+            pnls = day_to_pnls.get(d, [])
+            base_total = float(np.sum(pnls)) if pnls else 0.0
+            kept_total = float(np.sum(pnls[:taken])) if pnls else 0.0
+            skipped = base_total - kept_total              # lo que "se pierde" por cortar
+            d_pnl = kept_total - base_total                # impacto vs base (positivo = mejora)
+
+            dd_b = _day_dd_mag(pnls)
+            dd_s = _day_dd_mag(pnls[:taken])
+            d_dd = dd_b - dd_s                             # positivo = reduce caída intradía
+
+            pnl_total_base.append(base_total)
+            pnl_omitido.append(skipped)
+            delta_pnl.append(d_pnl)
+            dd_day_base.append(dd_b)
+            dd_day_sim.append(dd_s)
+            delta_dd.append(d_dd)
+            stop_ahorra.append(skipped < 0)                # si lo omitido era negativo, el corte evitó pérdidas
+
+        enriched["pnl_total_dia_base"] = pnl_total_base
+        enriched["pnl_omitido_por_corte"] = pnl_omitido
+        enriched["delta_pnl_vs_base"] = delta_pnl
+        enriched["dd_dia_base"] = dd_day_base
+        enriched["dd_dia_sim"] = dd_day_sim
+        enriched["mejora_dd_dia"] = delta_dd
+        enriched["evito_perdidas"] = stop_ahorra
+
+        # Resumen por motivo (lo realmente útil)
+        impact = (
+            enriched.groupby("motivo", as_index=False)
+            .agg(
+                dias=("fecha", "count"),
+                trades_omitidos=("trades_filtrados_por_stop", "sum"),
+                delta_pnl_total=("delta_pnl_vs_base", "sum"),
+                delta_pnl_prom=("delta_pnl_vs_base", "mean"),
+                mejora_dd_total=("mejora_dd_dia", "sum"),
+                mejora_dd_prom=("mejora_dd_dia", "mean"),
+                pct_evito_perdidas=("evito_perdidas", "mean"),
+            )
+        )
+        impact["pct_evito_perdidas"] = (impact["pct_evito_perdidas"] * 100).round(0)
+
+        # Gráficos de impacto (PnL y DD) — mucho más interpretables que "frecuencia"
+        leftg, rightg = st.columns(2)
+
+        with leftg:
+            st.markdown("**Impacto en PnL al cortar el día**")
+            figp = px.bar(
+                impact.sort_values("delta_pnl_total"),
+                x="motivo",
+                y="delta_pnl_total",
+                color="delta_pnl_total",
+                color_continuous_scale="RdYlGn",
+                color_continuous_midpoint=0,
+                text=impact.sort_values("delta_pnl_total")["delta_pnl_total"].round(0).astype(int),
+                hover_data={"dias": True, "trades_omitidos": True, "pct_evito_perdidas": True},
+                title="ΔPnL total vs base ($) — positivo = mejora",
+            )
+            figp.update_layout(xaxis_title="Regla", yaxis_title="ΔPnL ($)")
+            st.plotly_chart(figp, use_container_width=True)
+
+        with rightg:
+            st.markdown("**Impacto en Drawdown intradía (aprox.)**")
+            figd = px.bar(
+                impact.sort_values("mejora_dd_total"),
+                x="motivo",
+                y="mejora_dd_total",
+                color="mejora_dd_total",
+                color_continuous_scale="RdYlGn",
+                color_continuous_midpoint=0,
+                text=impact.sort_values("mejora_dd_total")["mejora_dd_total"].round(0).astype(int),
+                hover_data={"dias": True, "trades_omitidos": True, "pct_evito_perdidas": True},
+                title="Mejora DD total ($) — positivo = reduce caídas",
+            )
+            figd.update_layout(xaxis_title="Regla", yaxis_title="Mejora DD ($)")
+            st.plotly_chart(figd, use_container_width=True)
+
+        st.caption(
+            "Interpretación: **ΔPnL** positivo significa que cortar evitó más pérdidas de las que dejó pasar. "
+            "**Mejora DD** positiva significa menor caída intradía en los días donde se activó esa regla. "
+            "Esto es una aproximación por día (no reemplaza el DD global)."
+        )
+
+        # Tabla detallada (para quien quiera auditar)
+        with st.expander("Ver detalle por día (qué se omitió al cortar)"):
+            show_cols = [
+                "fecha", "motivo",
+                "trades_ejecutados", "trades_totales_dia", "trades_filtrados_por_stop",
+                "pnl_total_dia_base", "pnl_hasta_stop", "pnl_omitido_por_corte", "delta_pnl_vs_base",
+                "dd_dia_base", "dd_dia_sim", "mejora_dd_dia",
+            ]
+            st.dataframe(
+                enriched[show_cols].sort_values(["fecha"]),
+                use_container_width=True,
+                hide_index=True,
+            )
     else:
         st.info("Con estas reglas, no se activó ningún 'corte del día'.")
-
     # Consejos automáticos del Lab
     st.markdown("### 💡 Consejos automáticos (Lab)")
     if len(filtered) < 30:
@@ -2057,14 +2181,15 @@ else:
     if len(sim_kept) < max(10, int(0.25*len(filtered))):
         st.warning("La simulación está eliminando demasiados trades. Revisa si estás filtrando/cortando en exceso.")
 
-    if (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim < dd_base:
+    # OJO: dd_base/dd_sim son negativos (caída desde el pico). Para comparar "mejor/peor" usamos magnitudes.
+    if (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag < dd_base_mag:
         st.success("✅ Menor drawdown con reglas: buen candidato para un 'Daily Guard' realista.")
-    if (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim > dd_base:
-        st.warning("⚠️ Drawdown empeoró en la simulación: estas reglas podrían estar cortando recuperación o dejando pérdidas grandes.")
+    if (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag > dd_base_mag:
+        st.warning("⚠️ El drawdown empeoró en la simulación: estas reglas podrían estar cortando recuperación o dejando pérdidas grandes.")
 
-    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf > base_pf + 0.2 and (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim > dd_base:
+    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf > base_pf + 0.2 and (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag > dd_base_mag:
         st.info("Mejoró PF pero empeoró DD: típico cuando eliminas muchos trades pequeños pero te quedas con pérdidas grandes. Revisa filtros/horarios.")
-    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf < base_pf and (not np.isnan(dd_base)) and (not np.isnan(dd_sim)) and dd_sim < dd_base:
+    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf < base_pf and (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag < dd_base_mag:
         st.info("Bajó PF pero también bajó el DD: a veces vale la pena si tu objetivo es estabilidad (menos estrés / menos reset).")
 # Resumen final (muy user-friendly)
 # ============================================================
