@@ -2079,19 +2079,30 @@ def _apply_filters(df_in: pd.DataFrame):
         is_unknown = dnum.isna() | (dnum == 0)
 
         dir_opts = ["Largos", "Cortos", "Sin datos"]
-        dir_default = st.session_state.get("lab_dirs_allowed", dir_opts)
+        dir_default = st.session_state.get("lab_dirs_allowed", dir_opts) or []
+        dir_default = [x for x in dir_default if x in dir_opts]
+        if not dir_default:
+            dir_default = dir_opts
         sel_dirs = st.multiselect("Dirección permitida", dir_opts, default=dir_default, key="lab_dirs_allowed")
 
-        # Horas (entry preferido)
-        default_hours = st.session_state.get("lab_hours_allowed", hour_labels)
-        sel_hour_labels = st.multiselect(
-            "Horas permitidas (entrada)",
-            options=hour_labels,
-            default=default_hours,
-            key="lab_hours_allowed",
-            help="Cada hora representa el bloque completo HH:00–HH:59. Si falta ENTRY, se usa EXIT como respaldo."
-        )
-        sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
+        # Horas (ENTRY preferido; si falta, EXIT como respaldo)
+        # Nota Streamlit: `default` debe ser subconjunto de `options`.
+        if not hour_labels:
+            st.info("No se detectaron horas válidas (faltan timestamps en ENTRY/EXIT). Se omite el filtro por hora.")
+            sel_hours = None
+        else:
+            default_hours = st.session_state.get("lab_hours_allowed", hour_labels) or []
+            default_hours = [x for x in default_hours if x in hour_labels]
+            if not default_hours:
+                default_hours = hour_labels
+            sel_hour_labels = st.multiselect(
+                "Horas permitidas (entrada)",
+                options=hour_labels,
+                default=default_hours,
+                key="lab_hours_allowed",
+                help="Cada hora representa el bloque completo HH:00–HH:59. Si falta ENTRY, se usa EXIT como respaldo."
+            )
+            sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
 
         # Rangos (si existen columnas)
         or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)")
@@ -2144,7 +2155,7 @@ def _apply_filters(df_in: pd.DataFrame):
         notes.append("⚠️ No seleccionaste ninguna dirección; se ignora el filtro de dirección.")
 
     # Horas
-    if len(sel_hours) > 0 and "_lab_hour" in df.columns:
+    if (sel_hours is not None) and (len(sel_hours) > 0) and "_lab_hour" in df.columns:
         h = pd.to_numeric(df["_lab_hour"], errors="coerce")
         hmask = h.isin(sel_hours)
         if include_missing:
