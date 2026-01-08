@@ -2891,6 +2891,11 @@ else:
     if len(sim_kept) < max(10, int(0.25*len(filtered))):
         st.warning("La simulación está eliminando demasiados trades. Revisa si estás filtrando/cortando en exceso.")
 
+    # Magnitud de DD del simulado (por seguridad, siempre definida)
+    dd_sim_mag = _dd_mag_from_df(sim_kept) if (sim_kept is not None and not sim_kept.empty) else np.nan
+    # Magnitud de DD del real (por seguridad, siempre definida)
+    dd_base_f = _dd_mag_from_df(filtered) if (filtered is not None and not filtered.empty) else np.nan
+
     # OJO: dd_base/dd_sim son negativos (caída desde el pico). Para comparar "mejor/peor" usamos magnitudes.
     if (not np.isnan(dd_base_f)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag < dd_base_f:
         st.success("✅ Menor drawdown con reglas: buen candidato para un 'Daily Guard' realista.")
