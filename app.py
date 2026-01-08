@@ -2289,6 +2289,8 @@ else:
 
         # Punto "Combinado" (todas las reglas activas) si hay más de 1 regla
         if len(scenarios) >= 2:
+            pnl_base_comb = float(filtered["tradeRealized"].fillna(0).sum()) if (filtered is not None and not filtered.empty and "tradeRealized" in filtered.columns) else 0.0
+            pnl_sim_comb  = float(sim_kept["tradeRealized"].fillna(0).sum()) if (sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns) else 0.0
             rows.append({
                 "regla": "Combinado (todas)",
                 "trades_sim": int(len(sim_kept)) if sim_kept is not None else 0,
