@@ -2295,7 +2295,7 @@ else:
                 "regla": "Combinado (todas)",
                 "trades_sim": int(len(sim_kept)) if sim_kept is not None else 0,
                 "dias_cortados": int(len(stops_df)) if stops_df is not None else 0,
-                "delta_pnl": pnl_sim - pnl_base,
+                "delta_pnl": (float(sim_kept["tradeRealized"].sum()) if (sim_kept is not None and len(sim_kept)>0 and "tradeRealized" in sim_kept.columns) else 0.0) - (float(filtered["tradeRealized"].sum()) if (filtered is not None and len(filtered)>0 and "tradeRealized" in filtered.columns) else 0.0),
                 "mejora_dd": dd_base_mag - dd_sim_mag,
                 "pf_sim": sim_pf,
             })
