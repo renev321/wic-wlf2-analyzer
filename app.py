@@ -2633,6 +2633,8 @@ else:
         dd_day_sim = []
         delta_dd = []
         stop_ahorra = []
+        trades_totales = []
+        pnl_hasta_stop_list = []
 
         for _, r in enriched.iterrows():
             d = r["fecha"]
@@ -2640,6 +2642,8 @@ else:
             pnls = day_to_pnls.get(d, [])
             base_total = float(np.sum(pnls)) if pnls else 0.0
             kept_total = float(np.sum(pnls[:taken])) if pnls else 0.0
+            trades_totales.append(int(len(pnls)))
+            pnl_hasta_stop_list.append(float(kept_total))
             skipped = base_total - kept_total              # lo que "se pierde" por cortar
             d_pnl = kept_total - base_total                # impacto vs base (positivo = mejora)
 
@@ -2662,6 +2666,8 @@ else:
         enriched["dd_dia_sim"] = dd_day_sim
         enriched["mejora_dd_dia"] = delta_dd
         enriched["evito_perdidas"] = stop_ahorra
+        enriched["trades_totales_dia"] = trades_totales
+        enriched["pnl_hasta_stop"] = pnl_hasta_stop_list
 
         # Resumen por motivo (lo realmente útil)
         impact = (
@@ -2882,6 +2888,21 @@ else:
             st.plotly_chart(figwf, use_container_width=True)
 
             with st.expander("Ver tabla (what‑if por regla)"):
+                st.markdown(
+                    """**Cómo leer esta tabla (simple):**  
+
+**ΔPnL** = cuánto habría cambiado tu PnL total vs lo real (positivo = mejora).  
+
+**Mejora DD** = cuánto se reduce la peor caída (positivo = mejor).  
+
+**Días cortados** = días donde la regla detuvo el trading.  
+
+**Trades sim** = trades que quedarían con esa regla.  
+
+**PF sim** = Profit Factor del simulado.  
+
+**Cuadrante** = resumen del trade‑off (mejora DD pero cuesta PnL, etc.)."""
+                )
                 wf2 = wf.sort_values(["cuadrante","mejora_dd","delta_pnl"], ascending=[True, False, False]).copy()
                 wf2["delta_pnl"] = wf2["delta_pnl"].round(0).astype(int)
                 wf2["mejora_dd"] = wf2["mejora_dd"].round(0).astype(int)
