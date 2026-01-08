@@ -2528,26 +2528,18 @@ with lab_left:
             prof0 = sugg.get("max_intraday_profit", 0.0)
             st.caption(f"Baseline 1:1: para que las reglas NO corten nada, usa Max pérdida/día ≈ **{loss0:,.0f}** y Max ganancia/día ≈ **{prof0:,.0f}** (o deja 0 = sin límite).")
 
-        best_h = sugg.get("best_hour", None)
-        worst_h = sugg.get("worst_hour", None)
-        if best_h is not None and worst_h is not None:
-            st.write(f"🕒 Mejor hora promedio: **{_hour_label(best_h)}** | Peor: **{_hour_label(worst_h)}** (con muestra ≥ {5}).")
-
-        rec_mt = sugg.get("rec_max_trades", None)
-        if rec_mt is not None and rec_mt >= 1:
-            st.warning(f"📉 A partir del trade #{rec_mt+1} el promedio suele volverse negativo. Prueba **Máx trades/día = {rec_mt}**.", icon="⚠️")
+        st.markdown("#### 🧰 Filtros sugeridos (entrada)")
+        best_h = sugg.get("best_hour")
+        worst_h = sugg.get("worst_hour")
+        if (best_h is not None) and (worst_h is not None):
+            st.write(f"🕒 Mejor hora: **{_hour_label(best_h)}** | Peor: **{_hour_label(worst_h)}** (solo celdas con n ≥ 5).")
         else:
-            st.write("📌 No se ve un deterioro claro por # de trade (con la muestra actual).")
+            st.caption("🕒 Horas: no concluyente (necesitas celdas con n ≥ 5 por bloque horario).")
 
-        rec_streak = sugg.get("rec_max_consec_losses", None)
-        if rec_streak is not None:
-            rec_streak = max(1, int(rec_streak))
-            st.write(f"🔁 Racha típica (p75) de pérdidas seguidas por día: **{rec_streak}** → prueba Máx pérdidas seguidas = {rec_streak}.")
-
-        if "dir_stats" in sugg and not sugg["dir_stats"].empty:
+        if "dir_stats" in sugg and hasattr(sugg["dir_stats"], "empty") and not sugg["dir_stats"].empty:
             ds = sugg["dir_stats"]
             try:
-                long_mean = float(ds.loc["Compra","mean"]) if "Compra" in ds.index else np.nan
+                long_mean  = float(ds.loc["Compra","mean"]) if "Compra" in ds.index else np.nan
                 short_mean = float(ds.loc["Venta","mean"]) if "Venta" in ds.index else np.nan
                 st.write(f"📊 Compra avg: **{long_mean:,.0f}** | Venta avg: **{short_mean:,.0f}** (por trade).")
                 if np.isfinite(long_mean) and np.isfinite(short_mean):
@@ -2557,16 +2549,28 @@ with lab_left:
                         st.warning("⬅️ Considera filtrar **solo Venta** en el Lab y ver el impacto.", icon="⚠️")
             except Exception:
                 pass
+        else:
+            st.caption("📊 Dirección: no concluyente (faltan ENTRY o hay poca muestra).")
 
+        # OR/ATR suggestions (informativo)
+        osug = sugg.get("or_suggestion")
+        if isinstance(osug, dict):
+            st.write(f"🧱 OR sugerido: **{osug.get('best_range', '—')}** (PF {osug.get('best_pf', np.nan):.2f}, n={osug.get('best_n', 0)}) | evitar **{osug.get('worst_range', '—')}** (PF {osug.get('worst_pf', np.nan):.2f}, n={osug.get('worst_n', 0)}).")
+        asug = sugg.get("atr_suggestion")
+        if isinstance(asug, dict):
+            st.write(f"📏 ATR sugerido: **{asug.get('best_range', '—')}** (PF {asug.get('best_pf', np.nan):.2f}, n={asug.get('best_n', 0)}) | evitar **{asug.get('worst_range', '—')}** (PF {asug.get('worst_pf', np.nan):.2f}, n={asug.get('worst_n', 0)}).")
 
-            # OR/ATR suggestions (informativo)
-            osug = sugg.get("or_suggestion")
-            if isinstance(osug, dict):
-                st.write(f"🧱 OR sugerido: **{osug['best_range']}** (PF {osug['best_pf']:.2f}, n={osug['best_n']}) | peor: {osug['worst_range']} (PF {osug['worst_pf']:.2f}, n={osug['worst_n']}).")
-            asug = sugg.get("atr_suggestion")
-            if isinstance(asug, dict):
-                st.write(f"📏 ATR sugerido: **{asug['best_range']}** (PF {asug['best_pf']:.2f}, n={asug['best_n']}) | peor: {asug['worst_range']} (PF {asug['worst_pf']:.2f}, n={asug['worst_n']}).")
-
+        st.markdown("#### 🎛️ Reglas sugeridas (Daily Guard)")
+        rec_mt = sugg.get("rec_max_trades")
+        if rec_mt is not None:
+            st.write(f"🏁 Máx trades/día sugerido: **{int(rec_mt)}** (en tu muestra, más trades no mejoró el PnL mediano diario).")
+        else:
+            st.caption("🏁 Máx trades/día: no concluyente (muestra insuficiente).")
+        rec_streak = sugg.get("rec_max_consec_losses")
+        if rec_streak is not None:
+            st.write(f"🧯 Máx pérdidas seguidas sugerido: **{int(rec_streak)}** (para cortar rachas malas).")
+        else:
+            st.caption("🧯 Máx pérdidas seguidas: no concluyente (muestra insuficiente).")
         # RR-based suggestions
         if "after_stopout" in sugg:
             med, n = sugg["after_stopout"]
