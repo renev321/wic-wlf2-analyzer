@@ -2011,7 +2011,7 @@ def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, 
     if df is None or df.empty:
         return df, pd.DataFrame()
 
-    # Si no hay reglas, no simules nada: igualdad exacta con la base filtrada
+    # Si no hay reglas, no simules nada: igualdad exacta con la candidatos tras filtros
     rules_active = any([
         (max_loss and max_loss > 0),
         (max_profit and max_profit > 0),
@@ -2222,19 +2222,43 @@ if filtered is None or filtered.empty:
 else:
     sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
 
-    # Comparativa: base filtrada vs simulado (reglas)
-    st.markdown("### 📊 Resultados del Lab (base filtrada vs simulado)")
+    # Comparativa principal: real vs simulado (filtros + reglas)
+    
+    # ------------------------------------------------------------
+    # Comparativa principal: REAL (historial) vs SIMULADO (real + filtros + reglas)
+    # ------------------------------------------------------------
+    real_df = base_for_lab
+    cand_df = filtered        # candidatos tras filtros
+    sim_df  = sim_kept        # candidatos tras reglas diarias
+
+    n_real = int(len(real_df))
+    n_cand = int(len(cand_df))
+    n_sim  = int(len(sim_df))
+
+    omit_filtros = max(0, n_real - n_cand)
+    omit_reglas  = max(0, n_cand - n_sim)
+
+    pnl_real = float(real_df["tradeRealized"].fillna(0).sum()) if ("tradeRealized" in real_df.columns and len(real_df)) else 0.0
+    pnl_sim  = float(sim_df["tradeRealized"].fillna(0).sum()) if ("tradeRealized" in sim_df.columns and len(sim_df)) else 0.0
+
+    pf_real = profit_factor(real_df) if len(real_df) else np.nan
+    pf_sim  = profit_factor(sim_df)  if len(sim_df)  else np.nan
+
+    st.markdown("### 📊 Resultados del Lab (real vs simulado)")
     c1, c2, c3, c4, c5 = st.columns(5)
-    base_pf = profit_factor(filtered) if len(filtered) else np.nan
-    sim_pf = profit_factor(sim_kept) if len(sim_kept) else np.nan
+    c1.metric("Trades reales", f"{n_real}")
+    c2.metric("Trades simulados", f"{n_sim}", delta=f"{n_sim - n_real}")
+    c3.metric("PnL real ($)", f"{pnl_real:.0f}")
+    c4.metric("PnL simulado ($)", f"{pnl_sim:.0f}", delta=f"{(pnl_sim - pnl_real):.0f}")
+    c5.metric("PF real / sim", f"{fmt(pf_real,2)} / {fmt(pf_sim,2)}")
 
-    c1.metric("Trades (base filtrada)", f"{len(filtered)}")
-    c2.metric("Trades (sim)", f"{len(sim_kept)}", delta=f"{len(sim_kept)-len(filtered)}")
-    c3.metric("PnL base filtrada ($)", f"{filtered['tradeRealized'].sum():.0f}")
-    c4.metric("PnL simulado ($)", f"{sim_kept['tradeRealized'].sum():.0f}", delta=f"{(sim_kept['tradeRealized'].sum()-filtered['tradeRealized'].sum()):.0f}")
-    c5.metric("PF base / sim", f"{fmt(base_pf,2)} / {fmt(sim_pf,2)}")
+    d1, d2, d3 = st.columns(3)
+    d1.metric("Omitidos por filtros", f"{omit_filtros}")
+    d2.metric("Omitidos por reglas", f"{omit_reglas}")
+    dias_cortados = int(stops_df["fecha"].nunique()) if (stops_df is not None and not stops_df.empty and "fecha" in stops_df.columns) else 0
+    d3.metric("Días 'cortados' (reglas)", f"{dias_cortados}")
 
-    # Drawdown
+    # Drawdown (aprox) por curva de equity
     def _equity_df(df_):
         z = df_.copy()
         z = z.sort_values("exit_time" if "exit_time" in z.columns else "entry_time")
@@ -2243,35 +2267,34 @@ else:
         z["drawdown"] = z["equity"] - z["equity_peak"]
         return z
 
-    base_eq = _equity_df(filtered)
-    sim_eq = _equity_df(sim_kept)
+    real_eq = _equity_df(real_df) if len(real_df) else pd.DataFrame()
+    sim_eq  = _equity_df(sim_df)  if len(sim_df)  else pd.DataFrame()
 
-    dd_base = float(base_eq["drawdown"].min()) if len(base_eq) else np.nan
-    dd_sim = float(sim_eq["drawdown"].min()) if len(sim_eq) else np.nan
-    colx, coly, colz = st.columns(3)
-    dd_base_mag = abs(dd_base) if not np.isnan(dd_base) else np.nan
-    dd_sim_mag = abs(dd_sim) if not np.isnan(dd_sim) else np.nan
+    dd_real = float(real_eq["drawdown"].min()) if len(real_eq) else np.nan
+    dd_sim  = float(sim_eq["drawdown"].min())  if len(sim_eq)  else np.nan
 
-    colx.metric("Máx caída base ($)", f"{dd_base_mag:.0f}" if not np.isnan(dd_base_mag) else "N/A")
-    coly.metric("Máx caída sim ($)", f"{dd_sim_mag:.0f}" if not np.isnan(dd_sim_mag) else "N/A",
-                delta=f"{(dd_sim_mag-dd_base_mag):.0f}" if (not np.isnan(dd_sim_mag) and not np.isnan(dd_base_mag)) else None,
-                delta_color="inverse")
-    colz.metric("Días 'cortados' (reglas)", f"{len(stops_df)}")
-    st.caption("Máx caída (Drawdown) = peor retroceso desde el pico de la curva de equity. **Más bajo = mejor**.")
+    colx, coly = st.columns(2)
+    colx.metric("Máx caída real ($)", f"{abs(dd_real):.0f}" if not np.isnan(dd_real) else "—")
+    coly.metric("Máx caída sim ($)",  f"{abs(dd_sim):.0f}"  if not np.isnan(dd_sim)  else "—",
+                delta=f"{(abs(dd_real) - abs(dd_sim)):.0f}" if (not np.isnan(dd_real) and not np.isnan(dd_sim)) else None)
+
+    st.caption("Nota: el **simulado** aplica tus filtros (selectividad) y luego reglas diarias (corte). "
+               "Por eso puede tener menos trades que lo real. Para que coincida 1:1, deja filtros en 'todo' y reglas en 0.")
 
     # Equity curve
-    st.markdown("#### Curva de equity (base vs simulado)")
-    # Alineamos por índice temporal (exit_time)
-    base_plot = base_eq[["exit_time","equity"]].rename(columns={"equity":"Equity base"})
-    sim_plot = sim_eq[["exit_time","equity"]].rename(columns={"equity":"Equity sim"})
-    plot_df = pd.merge_asof(base_plot.sort_values("exit_time"),
-                            sim_plot.sort_values("exit_time"),
-                            on="exit_time", direction="nearest", tolerance=pd.Timedelta("1D"))
-    plot_df = plot_df.sort_values("exit_time")
-    fig = px.line(plot_df, x="exit_time", y=["Equity base","Equity sim"], title="Equity ($)")
-    st.plotly_chart(fig, use_container_width=True)
-
-    # Impacto de las reglas (en vez de solo frecuencia)
+    st.markdown("#### Curva de equity (real vs simulado)")
+    if len(real_eq) and len(sim_eq) and ("exit_time" in real_eq.columns) and ("exit_time" in sim_eq.columns):
+        real_plot = real_eq[["exit_time","equity"]].rename(columns={"equity":"Equity real"})
+        sim_plot  = sim_eq[["exit_time","equity"]].rename(columns={"equity":"Equity sim"})
+        plot_df = pd.merge_asof(real_plot.sort_values("exit_time"),
+                                sim_plot.sort_values("exit_time"),
+                                on="exit_time", direction="nearest", tolerance=pd.Timedelta("1D"))
+        plot_df = plot_df.sort_values("exit_time")
+        fig = px.line(plot_df, x="exit_time", y=["Equity real","Equity sim"], title="Equity ($)")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No hay datos suficientes para comparar curvas de equity.")
+# Impacto de las reglas (en vez de solo frecuencia)
     if stops_df is not None and not stops_df.empty:
         st.markdown("#### ¿Qué regla detuvo el día y qué impacto tuvo?")
 
@@ -2450,7 +2473,7 @@ else:
         # Esto evita confusión cuando varias reglas están activas a la vez.
         # ------------------------------------------------------------
         st.markdown("#### 🧩 What‑if por regla (una regla a la vez)")
-        st.caption("Aquí se simula **cada regla por separado** (manteniendo los filtros) y se compara contra la base filtrada. "
+        st.caption("Aquí se simula **cada regla por separado** (manteniendo los filtros) y se compara contra los **candidatos tras filtros**. "
                    "Sirve para ver el **trade‑off PnL vs Drawdown** sin mezclar reglas.")
 
         def _dd_mag_from_df(df_):
@@ -2465,7 +2488,7 @@ else:
 
         pnl_base_f = float(filtered["tradeRealized"].fillna(0).astype(float).sum()) if (filtered is not None and not filtered.empty) else 0.0
         dd_base_f  = _dd_mag_from_df(filtered)
-        pf_base_f  = profit_factor(filtered["tradeRealized"]) if (filtered is not None and not filtered.empty and "tradeRealized" in filtered.columns) else np.nan
+        pf_base_f  = profit_factor(filtered) if (filtered is not None and not filtered.empty and "tradeRealized" in filtered.columns) else np.nan
 
         # Construye escenarios individuales en función de lo que el usuario activó
         scenarios = []
@@ -2487,7 +2510,7 @@ else:
             sim_one, stops_one = _simulate_daily_rules(filtered, **params)
             pnl_sim_one = float(sim_one["tradeRealized"].fillna(0).astype(float).sum()) if (sim_one is not None and not sim_one.empty) else 0.0
             dd_sim_one  = _dd_mag_from_df(sim_one)
-            pf_sim_one  = profit_factor(sim_one["tradeRealized"]) if (sim_one is not None and not sim_one.empty and "tradeRealized" in sim_one.columns) else np.nan
+            pf_sim_one  = profit_factor(sim_one) if (sim_one is not None and not sim_one.empty and "tradeRealized" in sim_one.columns) else np.nan
 
             rows.append({
                 "regla": name,
