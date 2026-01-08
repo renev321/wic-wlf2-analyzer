@@ -1992,7 +1992,7 @@ with lab_left:
     max_profit = st.number_input("Max ganancia por día ($)", min_value=0.0, value=4500.0, step=100.0,
                                  help="Si el día llega a +MaxProfit, se corta el trading del día.")
     max_trades = st.slider("Máx trades por día (0 = sin límite)", min_value=0, max_value=10, value=3)
-    max_consec = st.slider("Máx pérdidas seguidas (0 = sin límite)", min_value=0, max_value=5, value=2)
+    max_consec_losses = st.slider("Máx pérdidas seguidas (0 = sin límite)", min_value=0, max_value=5, value=2)
     stop_big_loss = st.checkbox("Cortar el día tras un stop-out fuerte (RR ≤ -1)", value=False)
     stop_big_win = st.checkbox("Cortar el día tras un ganador grande (RR ≥ 2)", value=False)
 
@@ -2009,7 +2009,7 @@ with lab_right:
 if filtered is None or filtered.empty:
     st.info("Con los filtros actuales no quedan trades para simular.")
 else:
-    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec, stop_big_loss, stop_big_win)
+    sim_kept, stops_df = _simulate_daily_rules(filtered, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
 
     # Comparativa: base filtrada vs simulado (reglas)
     st.markdown("### 📊 Resultados del Lab (base filtrada vs simulado)")
