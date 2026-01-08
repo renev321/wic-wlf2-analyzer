@@ -1957,132 +1957,153 @@ def _lab_quick_suggestions(t: pd.DataFrame, min_bucket: int = 5) -> dict:
 
 def _apply_filters(df_in: pd.DataFrame):
     """
-    Lab filters (optional) applied BEFORE daily-rule simulation.
-    Returns: (filtered_df, filter_notes:list[str])
+    Lab filters (opcional) aplicados ANTES de simular reglas diarias.
+    Devuelve: (df_filtrado, notas:list[str])
     """
     df = df_in.copy()
-    notes = []
+    notes: list[str] = []
 
+    # --- toggle: incluir trades con datos faltantes (NaN) ---
     include_missing = bool(st.session_state.get("lab_include_missing", True))
 
-    # --- Build per-row timestamp for hour filtering (entry preferred, else exit) ---
-    ts_entry = pd.to_datetime(df["entry_time"], errors="coerce") if "entry_time" in df.columns else pd.Series([pd.NaT] * len(df), index=df.index)
-    ts_exit  = pd.to_datetime(df["exit_time"],  errors="coerce") if "exit_time"  in df.columns else pd.Series([pd.NaT] * len(df), index=df.index)
+    # --- timestamp por fila para filtrar horas (ENTRY preferido, si no EXIT) ---
+    ts_entry = pd.to_datetime(df["entry_time"], errors="coerce") if "entry_time" in df.columns else pd.Series(pd.NaT, index=df.index)
+    ts_exit  = pd.to_datetime(df["exit_time"],  errors="coerce") if "exit_time"  in df.columns else pd.Series(pd.NaT, index=df.index)
 
     df["_lab_ts"] = ts_entry
-    if "exit_time" in df.columns:
-        df["_lab_ts"] = df["_lab_ts"].fillna(ts_exit)
+    # fallback a EXIT solo para filas sin ENTRY
+    df.loc[df["_lab_ts"].isna(), "_lab_ts"] = ts_exit[df["_lab_ts"].isna()]
+    df["_lab_hour"] = pd.to_datetime(df["_lab_ts"], errors="coerce").dt.hour
 
-    # detect missing ENTRY rows (but with EXIT available)
-    miss_entry_cnt = int((ts_entry.isna() & ts_exit.notna()).sum()) if ("entry_time" in df.columns and "exit_time" in df.columns) else 0
-    if miss_entry_cnt > 0:
-        notes.append(f"⚠️ {miss_entry_cnt} operaciones no tienen ENTRY. Para filtros de hora se usa EXIT como respaldo; para Compra/Venta y OR/EWO/ATR/ratio se consideran 'Sin datos'.")
-
-    # hour list from actual dataset (row-wise)
-    if df["_lab_ts"].notna().any():
-        df["_lab_hour"] = df["_lab_ts"].dt.hour
-        avail_hours = sorted([int(x) for x in df["_lab_hour"].dropna().unique().tolist()])
-    else:
-        df["_lab_hour"] = np.nan
+    # horas disponibles según dataset (si no hay nada, 0..23)
+    avail_hours = sorted([int(x) for x in df["_lab_hour"].dropna().unique().tolist()])
+    if len(avail_hours) == 0:
         avail_hours = list(range(24))
 
     hour_labels = [_hour_label(h) for h in avail_hours] if "_hour_label" in globals() else [f"{h:02d}:00–{h:02d}:59" for h in avail_hours]
     label_to_hour = {lab: h for lab, h in zip(hour_labels, avail_hours)}
 
+    # --- helper UI: slider rango basado en min/max del dataset ---
+    def _range_slider_for(col: str, key: str, title: str, unit_hint: str = ""):
+        if col not in df.columns:
+            return None
+        lo0, hi0 = _finite_minmax(df[col]) if "_finite_minmax" in globals() else (None, None)
+        if lo0 is None or hi0 is None:
+            return None
+        # default: rango completo (no filtra)
+        default = st.session_state.get(key, (float(lo0), float(hi0)))
+        try:
+            default = (float(default[0]), float(default[1]))
+        except Exception:
+            default = (float(lo0), float(hi0))
+
+        step = max((float(hi0) - float(lo0)) / 200.0, 0.01)
+        label = f"{title}" + (f" ({unit_hint})" if unit_hint else "")
+        rng = st.slider(label, float(lo0), float(hi0), default, step=step, key=key)
+        return rng
+
+    # --- helper: aplicar rango inclusivo (con opción de incluir NaN) ---
+    def _apply_range_mask(dfx: pd.DataFrame, col: str, rng):
+        if col not in dfx.columns or rng is None:
+            return dfx
+        lo, hi = rng
+        s = pd.to_numeric(dfx[col], errors="coerce")
+        mask = (s >= float(lo)) & (s <= float(hi))
+        if include_missing:
+            mask = mask | s.isna()
+        return dfx[mask].copy()
+
+    # --- helper: threshold mínimo (>=) ---
+    def _apply_min_mask(dfx: pd.DataFrame, col: str, thr):
+        if col not in dfx.columns or thr is None:
+            return dfx
+        s = pd.to_numeric(dfx[col], errors="coerce")
+        mask = s >= float(thr)
+        if include_missing:
+            mask = mask | s.isna()
+        return dfx[mask].copy()
+
     # --- UI ---
     with st.container():
         st.markdown("### Filtros (opcional)")
-        st.caption("Estos filtros solo afectan la **simulación** (y, si quieres, el subconjunto que comparas). Por defecto (Reset) no eliminan nada.")
+        st.caption("Estos filtros afectan **solo** la simulación. En Reset no deberían eliminar nada.")
+
         include_missing = st.checkbox(
-            "Incluir también operaciones con datos faltantes (p. ej. sin ENTRY) en los filtros",
+            "Incluir trades con datos faltantes (NaN) en filtros (recomendado)",
             value=include_missing,
             key="lab_include_missing",
-            help="Si desactivas esto, las operaciones con campos vacíos (NaN) se excluyen cuando aplicas filtros."
+            help="Si un trade no tiene ENTRY (o algún indicador), aparecerá como 'Sin datos'. Activado = no se excluye por defecto."
         )
 
-        # Direction
-        dirs_all = ["Largos", "Cortos", "Sin datos"]
-        default_dirs = st.session_state.get("lab_dirs_allowed", dirs_all)
-        sel_dirs = st.multiselect(
-            "Dirección permitida",
-            options=dirs_all,
-            default=default_dirs,
-            key="lab_dirs_allowed",
-            help="‘Sin datos’ incluye operaciones donde no se puede inferir Compra/Venta (por ejemplo, falta ENTRY)."
-        )
+        # Dirección (Compra/Venta)
+        dir_col = None
+        for c in ["dir", "tradeDirection", "direction"]:
+            if c in df.columns:
+                dir_col = c
+                break
 
-        # Hours
+        if dir_col:
+            dnum = pd.to_numeric(df[dir_col], errors="coerce")
+        else:
+            dnum = pd.Series(np.nan, index=df.index)
+
+        is_long = dnum > 0
+        is_short = dnum < 0
+        is_unknown = dnum.isna() | (dnum == 0)
+
+        dir_opts = ["Largos", "Cortos", "Sin datos"]
+        dir_default = st.session_state.get("lab_dirs_allowed", dir_opts)
+        sel_dirs = st.multiselect("Dirección permitida", dir_opts, default=dir_default, key="lab_dirs_allowed")
+
+        # Horas (entry preferido)
         default_hours = st.session_state.get("lab_hours_allowed", hour_labels)
-        sel_hours_lbl = st.multiselect(
+        sel_hour_labels = st.multiselect(
             "Horas permitidas (entrada)",
             options=hour_labels,
             default=default_hours,
             key="lab_hours_allowed",
-            help="Cada hora representa el bloque completo (p. ej. 9 AM = 09:00–09:59). Si falta ENTRY, se usa la hora del EXIT como respaldo."
+            help="Cada hora representa el bloque completo HH:00–HH:59. Si falta ENTRY, se usa EXIT como respaldo."
         )
-        sel_hours = [label_to_hour[x] for x in sel_hours_lbl if x in label_to_hour]
+        sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
 
-        # OR / ATR ranges
-        def _range_slider(col, key, title, unit_hint=""):
-            if col not in df.columns:
-                return None
-            s = pd.to_numeric(df[col], errors="coerce")
-            lo = float(np.nanmin(s)) if np.isfinite(np.nanmin(s)) else 0.0
-            hi = float(np.nanmax(s)) if np.isfinite(np.nanmax(s)) else 0.0
-            if not np.isfinite(lo) or not np.isfinite(hi) or lo == hi:
-                lo, hi = 0.0, float(lo if np.isfinite(lo) else 0.0)
+        # Rangos (si existen columnas)
+        or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)")
+        atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)")
 
-            default = st.session_state.get(key, (lo, hi))
-            rng = st.slider(
-                title + (f" ({unit_hint})" if unit_hint else ""),
-                min_value=float(lo),
-                max_value=float(hi),
-                value=(float(default[0]), float(default[1])),
-                step=float((hi - lo) / 200.0) if hi > lo else 0.01,
-                key=key
-            )
-            return rng
+        # EWO (umbral mínimo sobre |EWO|)
+        ewo_col = "ewo" if "ewo" in df.columns else ("ewoMag" if "ewoMag" in df.columns else None)
+        ewo_thr = None
+        if ewo_col:
+            ewo_abs = pd.to_numeric(df[ewo_col], errors="coerce").abs()
+            lo_ewo, hi_ewo = _finite_minmax(ewo_abs) if "_finite_minmax" in globals() else (None, None)
+            if lo_ewo is not None and hi_ewo is not None:
+                ewo_thr = st.slider("|EWO| mínimo", float(lo_ewo), float(hi_ewo), float(st.session_state.get("lab_ewo_thr", float(lo_ewo))), step=max((float(hi_ewo)-float(lo_ewo))/200.0, 0.0001), key="lab_ewo_thr")
 
-        _range_slider("orSize", "lab_or_rng", "OR Size permitido", unit_hint="puntos (según tu log)")
-        _range_slider("atr",    "lab_atr_rng", "ATR permitido", unit_hint="puntos (según tu log)")
-
-        # EWO / Abs / Activity thresholds
-        if "ewo" in df.columns:
-            ewo_vals = pd.to_numeric(df["ewo"], errors="coerce").abs()
-            ewo_min = float(np.nanmin(ewo_vals)) if np.isfinite(np.nanmin(ewo_vals)) else 0.0
-            ewo_max = float(np.nanmax(ewo_vals)) if np.isfinite(np.nanmax(ewo_vals)) else 0.0
-            default = float(st.session_state.get("lab_ewo_thr", ewo_min))
-            st.slider("|EWO| mínimo", min_value=float(ewo_min), max_value=float(ewo_max), value=float(default), key="lab_ewo_thr")
-
+        # Absorción / Actividad (si existen)
+        abs_max = None
         if "absorption" in df.columns:
-            abs_vals = pd.to_numeric(df["absorption"], errors="coerce")
-            abs_min = float(np.nanmin(abs_vals)) if np.isfinite(np.nanmin(abs_vals)) else 0.0
-            abs_max = float(np.nanmax(abs_vals)) if np.isfinite(np.nanmax(abs_vals)) else 0.0
-            default = float(st.session_state.get("lab_abs_max", abs_max))
-            st.slider("Absorción máxima (evitar extremos)", min_value=float(abs_min), max_value=float(abs_max), value=float(default), key="lab_abs_max")
+            lo_a, hi_a = _finite_minmax(df["absorption"]) if "_finite_minmax" in globals() else (None, None)
+            if lo_a is not None and hi_a is not None:
+                abs_max = st.slider("Absorción máxima (evitar extremos)", float(lo_a), float(hi_a), float(st.session_state.get("lab_abs_max", float(hi_a))), step=max((float(hi_a)-float(lo_a))/200.0, 0.01), key="lab_abs_max")
 
+        act_min = None
         if "activity_rel" in df.columns:
-            act_vals = pd.to_numeric(df["activity_rel"], errors="coerce")
-            act_min = float(np.nanmin(act_vals)) if np.isfinite(np.nanmin(act_vals)) else 0.0
-            act_max = float(np.nanmax(act_vals)) if np.isfinite(np.nanmax(act_vals)) else 0.0
-            default = float(st.session_state.get("lab_act_min", act_min))
-            st.slider("Actividad mínima (volumen relativo antes de entrar)", min_value=float(act_min), max_value=float(act_max), value=float(default), key="lab_act_min")
+            lo_r, hi_r = _finite_minmax(df["activity_rel"]) if "_finite_minmax" in globals() else (None, None)
+            if lo_r is not None and hi_r is not None:
+                act_min = st.slider("Actividad mínima (volumen relativo antes de entrar)", float(lo_r), float(hi_r), float(st.session_state.get("lab_act_min", float(lo_r))), step=max((float(hi_r)-float(lo_r))/200.0, 0.0001), key="lab_act_min")
 
-        # Optional boolean filter
-        avoid_no_support = bool(st.session_state.get("lab_avoid_sin_apoyo", False))
-        st.checkbox("Evitar 'sin apoyo' (presión vs avance en contra)", value=avoid_no_support, key="lab_avoid_sin_apoyo")
+        # Evitar "sin apoyo" (si existe una columna compatible)
+        no_support_col = None
+        for c in ["noSupport", "sinApoyo", "no_support", "no_support_flag"]:
+            if c in df.columns:
+                no_support_col = c
+                break
+        avoid_no_support = False
+        if no_support_col:
+            avoid_no_support = st.checkbox("Evitar 'sin apoyo' (presión vs avance en contra)", value=bool(st.session_state.get("lab_avoid_no_support", False)), key="lab_avoid_no_support")
 
-    # --- Apply filters ---
-    # Direction mask
-    if "dir" in df.columns:
-        dnum = pd.to_numeric(df["dir"], errors="coerce")
-    else:
-        dnum = pd.Series([np.nan] * len(df), index=df.index)
-
-    is_long = dnum > 0
-    is_short = dnum < 0
-    is_unknown = dnum.isna() | (dnum == 0)
-
+    # --- aplicar filtros ---
+    # Dirección
     dir_mask = pd.Series(False, index=df.index)
     if "Largos" in sel_dirs:
         dir_mask |= is_long
@@ -2090,14 +2111,12 @@ def _apply_filters(df_in: pd.DataFrame):
         dir_mask |= is_short
     if "Sin datos" in sel_dirs:
         dir_mask |= is_unknown
-
-    # If user unselects everything (shouldn't happen), keep all
     if dir_mask.any():
         df = df[dir_mask].copy()
     else:
         notes.append("⚠️ No seleccionaste ninguna dirección; se ignora el filtro de dirección.")
 
-    # Hours mask
+    # Horas
     if len(sel_hours) > 0 and "_lab_hour" in df.columns:
         h = pd.to_numeric(df["_lab_hour"], errors="coerce")
         hmask = h.isin(sel_hours)
@@ -2105,65 +2124,40 @@ def _apply_filters(df_in: pd.DataFrame):
             hmask = hmask | h.isna()
         df = df[hmask].copy()
 
-    
-# Range filter helper (inclusive)
-def _apply_range(df_: pd.DataFrame, col: str, key: str) -> pd.DataFrame:
-    if col not in df_.columns:
-        return df_
-    if key not in st.session_state:
-        return df_
-    lo, hi = st.session_state.get(key, (None, None))
-    if lo is None or hi is None:
-        return df_
-    s = pd.to_numeric(df_[col], errors="coerce")
-    mask = (s >= float(lo)) & (s <= float(hi))
-    if include_missing:
-        mask = mask | s.isna()
-    return df_[mask].copy()
+    # Rangos
+    df = _apply_range_mask(df, "orSize", or_rng)
+    df = _apply_range_mask(df, "atr", atr_rng)
 
-    df = _apply_range(df, "orSize", "lab_or_rng")
-    df = _apply_range(df, "atr", "lab_atr_rng")
-
-    # EWO
-    if "ewo" in df.columns and "lab_ewo_thr" in st.session_state:
-        thr = float(st.session_state.get("lab_ewo_thr", 0.0))
-        s = pd.to_numeric(df["ewo"], errors="coerce").abs()
-        mask = s >= thr
+    # EWO min
+    if ewo_col and ewo_thr is not None:
+        s = pd.to_numeric(df[ewo_col], errors="coerce").abs()
+        mask = s >= float(ewo_thr)
         if include_missing:
             mask = mask | s.isna()
         df = df[mask].copy()
 
-    # Absorption (max)
-    if "absorption" in df.columns and "lab_abs_max" in st.session_state:
-        mx = float(st.session_state.get("lab_abs_max"))
+    # Absorción max
+    if "absorption" in df.columns and abs_max is not None:
         s = pd.to_numeric(df["absorption"], errors="coerce")
-        mask = s <= mx
+        mask = s <= float(abs_max)
         if include_missing:
             mask = mask | s.isna()
         df = df[mask].copy()
 
-    # Activity (min)
-    if "activity_rel" in df.columns and "lab_act_min" in st.session_state:
-        mn = float(st.session_state.get("lab_act_min"))
-        s = pd.to_numeric(df["activity_rel"], errors="coerce")
-        mask = s >= mn
-        if include_missing:
-            mask = mask | s.isna()
-        df = df[mask].copy()
+    # Actividad min
+    if "activity_rel" in df.columns and act_min is not None:
+        df = _apply_min_mask(df, "activity_rel", act_min)
 
-    # Avoid no-support (if column exists and we can flag it)
-    if bool(st.session_state.get("lab_avoid_sin_apoyo", False)):
-        for col in ["no_support", "sin_apoyo", "flag_sin_apoyo"]:
-            if col in df.columns:
-                s = df[col]
-                # treat True/1 as "no support"
-                mask = ~(s.astype(str).str.lower().isin(["1", "true", "t", "y", "yes"]))
-                df = df[mask].copy()
-                break
+    # Evitar sin apoyo
+    if no_support_col and avoid_no_support:
+        s = df[no_support_col]
+        # tratamos True/1/"true" como "sin apoyo" (mal) -> excluir
+        bad = s.astype(str).str.lower().isin(["1", "true", "t", "y", "yes"])
+        if include_missing:
+            bad = bad.fillna(False)
+        df = df[~bad].copy()
 
     return df, notes
-
-
 def _reset_lab_state(base_df: pd.DataFrame):
     """Resetea el Lab para que arranque 1:1 con el Resumen rápido (REAL vs SIMULADO sin cortes)."""
     if base_df is None:
