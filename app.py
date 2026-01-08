@@ -1867,6 +1867,103 @@ def _apply_filters(base: pd.DataFrame):
     """
     df = base.copy()
     notes = []
+    # Helpers internos: sliders acotados al rango REAL del dataset (base) y filtros aplicados sobre df actual.
+    def _col_stats(col: str):
+        if col not in base.columns:
+            return None
+        s = pd.to_numeric(base[col], errors="coerce")
+        s = s[np.isfinite(s)]
+        if s.empty:
+            return None
+        return float(s.min()), float(s.max())
+
+    def _range_filter(col: str, key: str, label: str, unit_hint: str = "", fmt: str = None):
+        nonlocal df, notes
+        st_minmax = _col_stats(col)
+        if st_minmax is None:
+            st.caption(f"⚠️ {label}: sin dato en el log.")
+            return
+        lo0, hi0 = st_minmax
+        if not np.isfinite(lo0) or not np.isfinite(hi0):
+            st.caption(f"⚠️ {label}: sin dato en el log.")
+            return
+        if lo0 == hi0:
+            st.caption(f"ℹ️ {label}: valor constante ({lo0:.2f}).")
+            return
+        default = st.session_state.get(key, (lo0, hi0))
+        try:
+            d0, d1 = float(default[0]), float(default[1])
+        except Exception:
+            d0, d1 = lo0, hi0
+        d0 = max(lo0, min(hi0, d0))
+        d1 = max(lo0, min(hi0, d1))
+        if d0 > d1:
+            d0, d1 = lo0, hi0
+
+        help_txt = f"Rango real en tus datos: {lo0:.2f} a {hi0:.2f}."
+        if unit_hint:
+            help_txt += f" Unidad: {unit_hint}."
+        if fmt is None:
+            fmt = "%.2f"
+
+        lo, hi = st.slider(label, min_value=lo0, max_value=hi0, value=(d0, d1), key=key, format=fmt, help=help_txt)
+        # Activa filtro solo si no es el rango completo
+        if (lo > lo0) or (hi < hi0):
+            s = pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series([], dtype=float)
+            df = df[(s >= lo) & (s <= hi)].copy()
+            notes.append(label.split("(")[0].strip() or label)
+
+    def _min_filter(col: str, key: str, label: str, prefer_abs: bool = False, fmt: str = None):
+        nonlocal df, notes
+        st_minmax = _col_stats(col)
+        if st_minmax is None:
+            st.caption(f"⚠️ {label}: sin dato en el log.")
+            return
+        lo0, hi0 = st_minmax
+        if lo0 == hi0:
+            st.caption(f"ℹ️ {label}: valor constante ({lo0:.2f}).")
+            return
+        default = st.session_state.get(key, lo0)
+        try:
+            d = float(default)
+        except Exception:
+            d = lo0
+        d = max(lo0, min(hi0, d))
+        help_txt = f"Umbral mínimo. Rango real: {lo0:.2f} a {hi0:.2f}. Por defecto no filtra."
+        if fmt is None:
+            fmt = "%.2f"
+        thr = st.slider(label, min_value=lo0, max_value=hi0, value=d, key=key, format=fmt, help=help_txt)
+        if thr > lo0:
+            s = pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series([], dtype=float)
+            if prefer_abs:
+                s = s.abs()
+            df = df[s >= thr].copy()
+            notes.append(label.split("(")[0].strip() or label)
+
+    def _max_filter(col: str, key: str, label: str, fmt: str = None):
+        nonlocal df, notes
+        st_minmax = _col_stats(col)
+        if st_minmax is None:
+            st.caption(f"⚠️ {label}: sin dato en el log.")
+            return
+        lo0, hi0 = st_minmax
+        if lo0 == hi0:
+            st.caption(f"ℹ️ {label}: valor constante ({lo0:.2f}).")
+            return
+        default = st.session_state.get(key, hi0)
+        try:
+            d = float(default)
+        except Exception:
+            d = hi0
+        d = max(lo0, min(hi0, d))
+        help_txt = f"Máximo permitido. Rango real: {lo0:.2f} a {hi0:.2f}. Por defecto no filtra."
+        if fmt is None:
+            fmt = "%.2f"
+        mx = st.slider(label, min_value=lo0, max_value=hi0, value=d, key=key, format=fmt, help=help_txt)
+        if mx < hi0:
+            s = pd.to_numeric(df[col], errors="coerce") if col in df.columns else pd.Series([], dtype=float)
+            df = df[s <= mx].copy()
+            notes.append(label.split("(")[0].strip() or label)
 
     # Para horas/orden del día: usa ENTRY si existe, si no usa EXIT como respaldo (y lo avisamos).
     time_col = None
