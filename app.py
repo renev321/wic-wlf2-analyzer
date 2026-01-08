@@ -2151,9 +2151,61 @@ else:
                 title="Mejora DD total ($) — positivo = reduce caídas",
             )
             figd.update_layout(xaxis_title="Regla", yaxis_title="Mejora DD ($)")
+            
             st.plotly_chart(figd, use_container_width=True)
 
+        # Relación entre reglas: trade-off PnL vs reducción de drawdown (visión de cuadrantes)
+        if len(impact) >= 1:
+            impact_sc = impact.copy()
+            def _quad(row):
+                dp = float(row.get("delta_pnl_total", 0) or 0)
+                dd = float(row.get("mejora_dd_total", 0) or 0)
+                if dp >= 0 and dd >= 0:
+                    return "Mejora PnL y reduce DD"
+                if dp < 0 and dd >= 0:
+                    return "Reduce DD pero cuesta PnL"
+                if dp >= 0 and dd < 0:
+                    return "Mejora PnL pero empeora DD"
+                return "Empeora ambos"
+            impact_sc["cuadrante"] = impact_sc.apply(_quad, axis=1)
+
+            st.markdown("**Mapa PnL vs Drawdown por regla (trade‑off)**")
+            figs = px.scatter(
+                impact_sc,
+                x="delta_pnl_total",
+                y="mejora_dd_total",
+                size="dias" if "dias" in impact_sc.columns else None,
+                color="cuadrante",
+                hover_name="motivo",
+                hover_data={
+                    "dias": True,
+                    "trades_omitidos": True,
+                    "pct_evito_perdidas": True,
+                    "delta_pnl_total": ":.0f",
+                    "mejora_dd_total": ":.0f",
+                },
+                labels={
+                    "delta_pnl_total": "ΔPnL vs base ($)",
+                    "mejora_dd_total": "Mejora DD total ($)",
+                    "dias": "Días activada",
+                },
+                title="Cada punto = una regla. Derecha/arriba = mejor. Tamaño = días activada.",
+            )
+            figs.add_vline(x=0, line_dash="dash", opacity=0.4)
+            figs.add_hline(y=0, line_dash="dash", opacity=0.4)
+            figs.update_layout(xaxis_title="ΔPnL ($)  (positivo = mejora)", yaxis_title="Mejora DD ($)  (positivo = reduce caídas)")
+            st.plotly_chart(figs, use_container_width=True)
+
+            if len(impact_sc) >= 3:
+                try:
+                    r = float(np.corrcoef(impact_sc["delta_pnl_total"], impact_sc["mejora_dd_total"])[0,1])
+                    st.caption(f"Correlación entre ΔPnL y Mejora DD (entre reglas): r = {r:.2f}. "
+                               "Con pocas reglas, úsalo solo como referencia visual.")
+                except Exception:
+                    pass
+
         st.caption(
+
             "Interpretación: **ΔPnL** positivo significa que cortar evitó más pérdidas de las que dejó pasar. "
             "**Mejora DD** positiva significa menor caída intradía en los días donde se activó esa regla. "
             "Esto es una aproximación por día (no reemplaza el DD global)."
