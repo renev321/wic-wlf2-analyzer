@@ -2082,10 +2082,10 @@ def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, 
 # Inputs del Lab
 def _reset_lab_state(base_df: pd.DataFrame):
     # Reglas
-    st.session_state["lab_max_loss"] = 600.0
-    st.session_state["lab_max_profit"] = 4500.0
-    st.session_state["lab_max_trades"] = 3
-    st.session_state["lab_max_consec_losses"] = 2
+    st.session_state["lab_max_loss"] = 0.0
+    st.session_state["lab_max_profit"] = 0.0
+    st.session_state["lab_max_trades"] = 0
+    st.session_state["lab_max_consec_losses"] = 0
     st.session_state["lab_stop_big_loss"] = False
     st.session_state["lab_stop_big_win"] = False
 
@@ -2135,7 +2135,7 @@ def _reset_lab_state(base_df: pd.DataFrame):
 
 reset_col, reset_info = st.columns([1, 3])
 with reset_col:
-    if st.button("🔄 Reset experimento", help="Vuelve al estado inicial: mismas cifras que Resumen rápido + sin filtros."):
+    if st.button("🔄 Reset experimento", help="Resetea TODO (reglas sin límite + sin filtros) para que el Lab coincida 1:1 con el Resumen rápido."):
         _reset_lab_state(t)
 with reset_info:
     st.caption("Idea: el Lab **empieza igual que el Resumen rápido**. Luego ajustas reglas/filtros para ver el impacto (what‑if).")
@@ -2146,20 +2146,20 @@ with lab_left:
     st.markdown("**Reglas diarias**")
     max_loss = st.number_input(
         "Max pérdida por día ($)",
-        min_value=0.0, value=float(st.session_state.get("lab_max_loss", 600.0)), step=50.0,
+        min_value=0.0, value=float(st.session_state.get("lab_max_loss", 0.0)), step=50.0,
         key="lab_max_loss",
-        help="Si el día llega a -MaxLoss, se corta el trading del día."
+        help="0 = sin límite. Si el día llega a -MaxLoss, se corta el trading del día."
     )
     max_profit = st.number_input(
         "Max ganancia por día ($)",
-        min_value=0.0, value=float(st.session_state.get("lab_max_profit", 4500.0)), step=100.0,
+        min_value=0.0, value=float(st.session_state.get("lab_max_profit", 0.0)), step=100.0,
         key="lab_max_profit",
-        help="Si el día llega a +MaxProfit, se corta el trading del día."
+        help="0 = sin límite. Si el día llega a +MaxProfit, se corta el trading del día."
     )
     max_trades = st.slider("Máx trades por día (0 = sin límite)", min_value=0, max_value=10,
-                           value=int(st.session_state.get("lab_max_trades", 3)), key="lab_max_trades")
+                           value=int(st.session_state.get("lab_max_trades", 0)), key="lab_max_trades")
     max_consec_losses = st.slider("Máx pérdidas seguidas (0 = sin límite)", min_value=0, max_value=10,
-                                  value=int(st.session_state.get("lab_max_consec_losses", 2)), key="lab_max_consec_losses")
+                                  value=int(st.session_state.get("lab_max_consec_losses", 0)), key="lab_max_consec_losses")
     stop_big_loss = st.checkbox("Cortar el día tras un stop-out fuerte (RR ≤ -1)", value=bool(st.session_state.get("lab_stop_big_loss", False)),
                                 key="lab_stop_big_loss")
     stop_big_win = st.checkbox("Cortar el día tras un ganador grande (RR ≥ 2)", value=bool(st.session_state.get("lab_stop_big_win", False)),
