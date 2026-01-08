@@ -396,6 +396,33 @@ def profit_factor(trades) -> float:
     return wins / loss_abs
 
 
+
+def _dd_mag_from_df(df_: pd.DataFrame) -> float:
+    """Máx caída (drawdown) en magnitud ($) usando la curva de equity por trade.
+    Devuelve np.nan si df está vacío o None.
+    """
+    if df_ is None or getattr(df_, "empty", True):
+        return np.nan
+    z = df_.copy()
+    sort_col = "exit_time" if "exit_time" in z.columns else ("entry_time" if "entry_time" in z.columns else None)
+    if sort_col is not None:
+        # Orden consistente; NaT/NaN al final
+        z = z.sort_values(sort_col, na_position="last")
+    pnl = pd.to_numeric(z.get("tradeRealized", pd.Series([], dtype=float)), errors="coerce").fillna(0.0)
+    if pnl.empty:
+        return np.nan
+    eq = pnl.cumsum()
+    peak = eq.cummax()
+    dd = eq - peak
+    if dd.empty:
+        return np.nan
+    v = dd.min()
+    try:
+        return float(abs(v))
+    except Exception:
+        return np.nan
+
+
 def max_streak(outcomes: pd.Series, target: str):
     best_len, cur = 0, 0
     best_end = None
