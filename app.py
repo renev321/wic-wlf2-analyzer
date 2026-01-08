@@ -2272,7 +2272,11 @@ def _lab_quick_suggestions(real_df: pd.DataFrame, min_n: int = 5):
 
 # Inputs del Lab
 def _reset_lab_state(base_df: pd.DataFrame):
-    # Reglas
+    """Resetea el Lab para que arranque 1:1 con el Resumen rápido (REAL vs SIMULADO sin cortes)."""
+    if base_df is None:
+        base_df = pd.DataFrame()
+
+    # -------------------- Reglas (0 = sin límite) --------------------
     st.session_state["lab_max_loss"] = 0.0
     st.session_state["lab_max_profit"] = 0.0
     st.session_state["lab_max_trades"] = 0
@@ -2280,66 +2284,74 @@ def _reset_lab_state(base_df: pd.DataFrame):
     st.session_state["lab_stop_big_loss"] = False
     st.session_state["lab_stop_big_win"] = False
 
-    # Filtros (opcionales)
+    # -------------------- Helpers --------------------
+    def _minmax(col: str, default=(0.0, 1.0)):
+        if col in base_df.columns:
+            mn, mx = _finite_minmax(base_df[col])
+            if mn is None or mx is None:
+                return default
+            if mn == mx:
+                # Evita sliders degenerados (mismo min/max)
+                eps = 1e-9 if mn == 0 else abs(mn) * 1e-6
+                return float(mn - eps), float(mx + eps)
+            return float(mn), float(mx)
+        return default
+
+    def _min_abs(col: str, default=0.0):
+        if col in base_df.columns:
+            s = pd.to_numeric(base_df[col], errors="coerce")
+            s = s[np.isfinite(s)]
+            if s.empty:
+                return default
+            s = s.abs()
+            return float(s.min())
+        return default
+
+    def _min_val(col: str, default=0.0):
+        if col in base_df.columns:
+            s = pd.to_numeric(base_df[col], errors="coerce")
+            s = s[np.isfinite(s)]
+            if s.empty:
+                return default
+            return float(s.min())
+        return default
+
+    def _max_val(col: str, default=0.0):
+        if col in base_df.columns:
+            s = pd.to_numeric(base_df[col], errors="coerce")
+            s = s[np.isfinite(s)]
+            if s.empty:
+                return default
+            return float(s.max())
+        return default
+
+    # -------------------- Filtros (opcionales) --------------------
+    # Horas disponibles desde tu dataset (ENTRY si existe, si no EXIT como respaldo)
     time_col = None
     if "entry_time" in base_df.columns and base_df["entry_time"].notna().any():
         time_col = "entry_time"
     elif "exit_time" in base_df.columns and base_df["exit_time"].notna().any():
         time_col = "exit_time"
+
     if time_col is not None:
         hrs = pd.to_datetime(base_df[time_col], errors="coerce").dt.hour.dropna().unique().tolist()
         avail_hours = sorted([int(h) for h in hrs])
     else:
         avail_hours = list(range(24))
+
     if not avail_hours:
         avail_hours = list(range(24))
+
     st.session_state["lab_hours_allowed"] = [_hour_label(h) for h in avail_hours]
     st.session_state["lab_dirs_allowed"] = ["Largos", "Cortos"]
-    st.session_state["lab_or_min"] = or_min
-    st.session_state["lab_or_max"] = or_max
-    st.session_state["lab_ewo_min"] = ewo_min
-    st.session_state["lab_atr_min"] = atr_min
-    st.session_state["lab_atr_max"] = atr_max
-    st.session_state["lab_abs_max"] = abs_max
-    st.session_state["lab_act_min"] = act_min
+
+    # Rangos numéricos -> por defecto NO filtra (rango completo / umbral mínimo)
+    st.session_state["lab_or_rng"] = _minmax("orSize")
+    st.session_state["lab_atr_rng"] = _minmax("atr")
+    st.session_state["lab_ewo_thr"] = _min_abs("ewo", default=0.0)
+    st.session_state["lab_abs_max"] = _max_val("pre_absorcion", default=0.0)
+    st.session_state["lab_act_min"] = _min_val("pre_actividad_rel", default=0.0)
     st.session_state["lab_avoid_sin_apoyo"] = False
-
-    # Rangos numéricos dinámicos
-    if base_df is None or base_df.empty:
-        return
-
-    def _set_rng(col, key):
-        if col in base_df.columns:
-            mn, mx = _finite_minmax(base_df[col])
-            if mn is not None and mx is not None and mn != mx:
-                st.session_state[key] = (mn, mx)
-
-    def _set_min_abs(col, key):
-        if col in base_df.columns:
-            s = pd.to_numeric(base_df[col], errors="coerce").abs()
-            s = s[np.isfinite(s)]
-            if not s.empty:
-                st.session_state[key] = float(s.min())
-
-    def _set_max(col, key):
-        if col in base_df.columns:
-            s = pd.to_numeric(base_df[col], errors="coerce")
-            s = s[np.isfinite(s)]
-            if not s.empty:
-                st.session_state[key] = float(s.max())
-
-    def _set_min(col, key):
-        if col in base_df.columns:
-            s = pd.to_numeric(base_df[col], errors="coerce")
-            s = s[np.isfinite(s)]
-            if not s.empty:
-                st.session_state[key] = float(s.min())
-
-    _set_rng("orSize", "lab_or_rng")
-    _set_rng("atr", "lab_atr_rng")
-    _set_min_abs("ewo", "lab_ewo_thr")
-    _set_max("pre_absorcion", "lab_abs_max")
-    _set_min("pre_actividad_rel", "lab_act_min")
 
 
 reset_col, reset_info = st.columns([1, 3])
