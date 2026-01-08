@@ -2761,7 +2761,7 @@ else:
                 "dias_cortados": cut_days_total,
                 "delta_pnl": pnl_sim_comb - pnl_base_comb,
                 "mejora_dd": dd_base_f - dd_sim_mag,
-                "pf_sim": sim_pf,
+                "pf_sim": profit_factor(sim_kept) if (sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns) else np.nan,
             })
 
 
@@ -2847,9 +2847,9 @@ else:
     if (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag > dd_base_mag:
         st.warning("⚠️ El drawdown empeoró en la simulación: estas reglas podrían estar cortando recuperación o dejando pérdidas grandes.")
 
-    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf > base_pf + 0.2 and (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag > dd_base_mag:
+    if (not np.isnan(pf_real)) and (not np.isnan(pf_sim)) and pf_sim > pf_real + 0.2 and (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag > dd_base_mag:
         st.info("Mejoró PF pero empeoró DD: típico cuando eliminas muchos trades pequeños pero te quedas con pérdidas grandes. Revisa filtros/horarios.")
-    if (not np.isnan(base_pf)) and (not np.isnan(sim_pf)) and sim_pf < base_pf and (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag < dd_base_mag:
+    if (not np.isnan(pf_real)) and (not np.isnan(pf_sim)) and pf_sim < pf_real and (not np.isnan(dd_base_mag)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag < dd_base_mag:
         st.info("Bajó PF pero también bajó el DD: a veces vale la pena si tu objetivo es estabilidad (menos estrés / menos reset).")
 # Resumen final (muy user-friendly)
 # ============================================================
