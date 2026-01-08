@@ -1888,152 +1888,251 @@ def _finite_minmax(s: pd.Series):
 
 
 def _lab_quick_suggestions(t):
-    """Heurísticas rápidas basadas en tu historial REAL (no simulado).
-    Devuelve un dict con llaves opcionales:
-      - max_intraday_loss, max_intraday_profit (en $) para que NO corte nada
-      - best_hour, worst_hour (int 0..23) por promedio PnL/trade (con muestra >= min_bucket)
-      - rec_max_trades (int) sugerencia de máximo trades/día (si se ve deterioro)
-      - rec_max_consec_losses (int) p75 de racha de pérdidas por día
-      - dir_stats (df) resumen Compra/Venta/No definida
-      - or_suggestion / atr_suggestion (dict) rangos sugeridos (cuantiles) por PF/promedio
-    Nunca debe lanzar excepción; si falta data, devuelve {}.
     """
-    out = {}
-    try:
-        if t is None or t.empty:
-            return out
+    Sugerencias rápidas basadas SOLO en tu historial REAL (sin reglas ni filtros del lab).
 
-        base = t.copy()
-
-        # 1) Límites diarios "que no corten nada" (según peor/best día real)
-        if "fecha" in base.columns and "tradeRealized" in base.columns:
-            d = base.groupby("fecha")["tradeRealized"].sum()
-            if not d.empty:
-                out["max_intraday_loss"] = float(abs(d.min())) if d.min() < 0 else 0.0
-                out["max_intraday_profit"] = float(d.max()) if d.max() > 0 else 0.0
-
-        # 2) Mejor/peor hora por promedio PnL (requiere hora_entrada)
-        if "hora_entrada" in base.columns and "tradeRealized" in base.columns:
-            h = base.groupby("hora_entrada")["tradeRealized"].agg(["count", "mean"])
-            min_bucket = 8
-            h_ok = h[h["count"] >= min_bucket].copy()
-            if not h_ok.empty:
-                out["best_hour"] = int(h_ok["mean"].idxmax())
-                out["worst_hour"] = int(h_ok["mean"].idxmin())
-
-        # 3) Deterioro por orden del trade (1°,2°,3°...) para sugerir max trades/día
-        if "trade_order" in base.columns and "tradeRealized" in base.columns:
-            o = base.groupby("trade_order")["tradeRealized"].agg(["count", "mean"])
-            if not o.empty and (1 in o.index):
-                base_mean = float(o.loc[1, "mean"]) if np.isfinite(o.loc[1, "mean"]) else np.nan
-                rec = None
-                for k in sorted(o.index):
-                    if int(k) == 1:
-                        continue
-                    if o.loc[k, "count"] < 5:
-                        continue
-                    mk = float(o.loc[k, "mean"])
-                    if (np.isfinite(mk) and mk < 0) or (np.isfinite(base_mean) and np.isfinite(mk) and mk < 0.5 * base_mean):
-                        rec = int(k) - 1
-                        break
-                if rec is not None and rec > 0:
-                    out["rec_max_trades"] = rec
-
-        # 4) Racha de pérdidas intradía (p75)
-        if "fecha" in base.columns and "tradeRealized" in base.columns:
-            tmp = base.sort_values(["fecha", "entry_ts"] if "entry_ts" in base.columns else ["fecha"]).copy()
-            tmp["is_loss"] = tmp["tradeRealized"] < 0
-            max_streaks = []
-            for _, g in tmp.groupby("fecha"):
-                streak = 0
-                best = 0
-                for v in g["is_loss"].tolist():
-                    if v:
-                        streak += 1
-                        best = max(best, streak)
-                    else:
-                        streak = 0
-                if best > 0:
-                    max_streaks.append(best)
-            if max_streaks:
-                out["rec_max_consec_losses"] = int(np.percentile(max_streaks, 75))
-
-        # 5) Resumen por dirección
-        if "dir" in base.columns and "tradeRealized" in base.columns:
-            d2 = base[["dir", "tradeRealized"]].copy()
-
-            def _dlabel(v):
-                s = str(v).strip()
-                if s in ("1", "Long", "LONG"):
-                    return "Compra"
-                if s in ("-1", "Short", "SHORT"):
-                    return "Venta"
-                return "No definida"
-
-            d2["side"] = d2["dir"].apply(_dlabel)
-            out["dir_stats"] = d2.groupby("side")["tradeRealized"].agg(["count", "mean", "median"])
-
-        # 6) Rangos sugeridos por cuantiles para OR / ATR (informativo)
-        def _range_suggestion(col, label):
-            if col not in base.columns or "tradeRealized" not in base.columns:
-                return None
-            s = pd.to_numeric(base[col], errors="coerce")
-            p = pd.to_numeric(base["tradeRealized"], errors="coerce")
-            tmp = pd.DataFrame({col: s, "tradeRealized": p}).dropna()
-            if tmp.empty or tmp[col].nunique() < 3 or len(tmp) < 30:
-                return None
-            try:
-                tmp["rango"] = pd.qcut(tmp[col], q=3, duplicates="drop")
-            except Exception:
-                return None
-
-            def _pf(x):
-                x = pd.Series(x).dropna()
-                wins = x[x > 0].sum()
-                losses = -x[x < 0].sum()
-                if losses > 0:
-                    return float(wins / losses)
-                return float("inf") if wins > 0 else np.nan
-
-            g = tmp.groupby("rango")["tradeRealized"]
-            dfm = pd.DataFrame({
-                "rango": g.size().index,
-                "n": g.size().values,
-                "promedio": g.mean().values,
-                "pf": g.apply(_pf).values,
-            })
-            dfm = dfm[dfm["n"] >= 5].copy()
-            if dfm.empty:
-                return None
-            best = dfm.sort_values(["pf", "promedio"], ascending=False).iloc[0]
-            worst = dfm.sort_values(["pf", "promedio"], ascending=True).iloc[0]
-
-            def _fmt(r):
-                try:
-                    return f"{float(r.left):.2f}–{float(r.right):.2f}"
-                except Exception:
-                    return str(r)
-
-            return {
-                "label": label,
-                "best_range": _fmt(best["rango"]),
-                "best_pf": float(best["pf"]) if np.isfinite(best["pf"]) else np.nan,
-                "best_avg": float(best["promedio"]) if np.isfinite(best["promedio"]) else np.nan,
-                "best_n": int(best["n"]),
-                "worst_range": _fmt(worst["rango"]),
-                "worst_pf": float(worst["pf"]) if np.isfinite(worst["pf"]) else np.nan,
-                "worst_avg": float(worst["promedio"]) if np.isfinite(worst["promedio"]) else np.nan,
-                "worst_n": int(worst["n"]),
-            }
-
-        out["or_suggestion"] = _range_suggestion("orSize", "OR Size")
-        out["atr_suggestion"] = _range_suggestion("atr", "ATR")
-
-        return out
-    except Exception:
+    Devuelve:
+      {"filters": [(titulo, texto), ...], "rules": [(titulo, texto), ...]}
+    """
+    out = {"filters": [], "rules": []}
+    if t is None or getattr(t, "empty", True):
         return out
 
+    base = t.copy()
 
+    # --- Columnas robustas para análisis ---
+    # Hora: prioriza entry_time, si falta usa exit_time, y si no existe usa _lab_ts.
+    hour = None
+    if "entry_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["entry_time"]):
+        hour = base["entry_time"].dt.hour
+    elif "_lab_ts" in base.columns and pd.api.types.is_datetime64_any_dtype(base["_lab_ts"]):
+        hour = base["_lab_ts"].dt.hour
+    else:
+        hour = pd.Series(np.nan, index=base.index)
+
+    if "exit_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["exit_time"]):
+        hour = hour.where(~hour.isna(), base["exit_time"].dt.hour)
+
+    base["_hour"] = pd.to_numeric(hour, errors="coerce")
+
+    # Dirección: usa dir numérico si existe; si no, intenta inferir de 'lado'.
+    if "dir" in base.columns:
+        dir_num = pd.to_numeric(base["dir"], errors="coerce")
+    elif "tradeDirection" in base.columns:
+        dir_num = pd.to_numeric(base["tradeDirection"], errors="coerce")
+    else:
+        dir_num = pd.Series(np.nan, index=base.index)
+
+    base["_dir_num"] = dir_num
+    base["_dir_label"] = np.where(
+        base["_dir_num"] > 0,
+        "Compra",
+        np.where(base["_dir_num"] < 0, "Venta", "No definida")
+    )
+
+    if "lado" in base.columns:
+        lado = base["lado"].astype(str)
+        base["_dir_label"] = np.where(
+            lado.str.contains("Compra", na=False),
+            "Compra",
+            np.where(lado.str.contains("Venta", na=False), "Venta", base["_dir_label"])
+        )
+
+    # Asegura tradeRealized numérico
+    if "tradeRealized" in base.columns:
+        base["tradeRealized"] = pd.to_numeric(base["tradeRealized"], errors="coerce")
+
+    # --- 1) Horas sugeridas (bloque HH:00–HH:59) ---
+    min_n_hour = 5
+    if "_hour" in base.columns and "tradeRealized" in base.columns:
+        tmp = base.dropna(subset=["_hour", "tradeRealized"]).copy()
+        if not tmp.empty:
+            tmp["_hour"] = tmp["_hour"].astype(int)
+            g = tmp.groupby("_hour")["tradeRealized"].agg(["count", "mean"])
+            g = g[g["count"] >= min_n_hour]
+            if len(g) >= 2:
+                best = g.sort_values("mean", ascending=False).head(2).index.tolist()
+                worst = g.sort_values("mean", ascending=True).head(2).index.tolist()
+
+                def _fmt_hour(h):
+                    return f"{int(h):02d}:00–{int(h):02d}:59"
+
+                best_lbl = ", ".join(_fmt_hour(h) for h in best)
+                worst_lbl = ", ".join(_fmt_hour(h) for h in worst)
+
+                out["filters"].append((
+                    "🕒 Horas",
+                    f"Sugerido: {best_lbl}. Evitar: {worst_lbl}. (n≥{min_n_hour} por hora)"
+                ))
+            else:
+                out["filters"].append((
+                    "🕒 Horas",
+                    f"No concluyente (necesitas n≥{min_n_hour} por bloque horario)."
+                ))
+        else:
+            out["filters"].append(("🕒 Horas", "No concluyente (no hay timestamps suficientes)."))
+
+    # --- 2) Dirección sugerida (Compra/Venta/No definida) ---
+    min_n_dir = 10
+    if "_dir_label" in base.columns and "tradeRealized" in base.columns:
+        d = base.dropna(subset=["tradeRealized"]).copy()
+        if not d.empty:
+            stats = d.groupby("_dir_label")["tradeRealized"].agg(["count", "mean"])
+            buy_n = int(stats.loc["Compra", "count"]) if "Compra" in stats.index else 0
+            sell_n = int(stats.loc["Venta", "count"]) if "Venta" in stats.index else 0
+            buy_mean = float(stats.loc["Compra", "mean"]) if "Compra" in stats.index else np.nan
+            sell_mean = float(stats.loc["Venta", "mean"]) if "Venta" in stats.index else np.nan
+
+            msg = f"Compra prom: {buy_mean:.1f} (n={buy_n}) | Venta prom: {sell_mean:.1f} (n={sell_n})."
+            # Recomendación simple si hay muestra suficiente en ambos lados
+            if buy_n >= min_n_dir and sell_n >= min_n_dir and not (np.isnan(buy_mean) or np.isnan(sell_mean)):
+                if buy_mean > sell_mean * 1.15:
+                    msg += " → Históricamente te va mejor en **Compra**."
+                elif sell_mean > buy_mean * 1.15:
+                    msg += " → Históricamente te va mejor en **Venta**."
+                else:
+                    msg += " → Diferencia pequeña (no concluyente)."
+            else:
+                msg += f" (Recomendación requiere n≥{min_n_dir} por lado)."
+
+            out["filters"].append(("📈 Dirección", msg))
+
+    # --- 3) OR/ATR sugeridos (por cuantiles; usa PF) ---
+    def _suggest_range_by_pf(col, label):
+        if col not in base.columns or "tradeRealized" not in base.columns:
+            return None
+        x = pd.to_numeric(base[col], errors="coerce")
+        y = pd.to_numeric(base["tradeRealized"], errors="coerce")
+        tmp = pd.DataFrame({"x": x, "y": y}).dropna()
+        if len(tmp) < 30:
+            return None
+
+        # 3 buckets por cuantiles (evita 'bin' en texto)
+        try:
+            tmp["grp"] = pd.qcut(tmp["x"], q=3, duplicates="drop")
+        except Exception:
+            return None
+
+        rows = []
+        for grp, g in tmp.groupby("grp"):
+            n = len(g)
+            pf = profit_factor(g["y"])
+            if pd.isna(pf):
+                continue
+            rows.append((grp.left, grp.right, float(pf), int(n)))
+
+        if len(rows) < 2:
+            return None
+
+        rows = sorted(rows, key=lambda r: r[2], reverse=True)
+        best = rows[0]
+        worst = rows[-1]
+
+        def _rng(a, b):
+            return f"{a:.2f}–{b:.2f}"
+
+        return f"{label}: { _rng(best[0], best[1]) } (PF {best[2]:.2f}, n={best[3]}) | evitar { _rng(worst[0], worst[1]) } (PF {worst[2]:.2f}, n={worst[3]})."
+
+    or_msg = _suggest_range_by_pf("orSize", "OR sugerido")
+    if or_msg:
+        out["filters"].append(("🧱 OR", or_msg))
+
+    atr_msg = _suggest_range_by_pf("atr", "ATR sugerido")
+    if atr_msg:
+        out["filters"].append(("📏 ATR", atr_msg))
+
+    # --- 4) Reglas sugeridas (Daily Guard): Máx trades/día / Máx pérdidas seguidas ---
+    if "tradeRealized" in base.columns:
+        base_pnl = float(pd.to_numeric(base["tradeRealized"], errors="coerce").fillna(0).sum())
+        dd_base = _dd_mag_from_df(base)
+
+        # candidatos según distribución real (acota a algo razonable)
+        if "entry_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["entry_time"]):
+            dt_for_day = base["entry_time"]
+        elif "exit_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["exit_time"]):
+            dt_for_day = base["exit_time"]
+        else:
+            dt_for_day = None
+
+        if dt_for_day is not None:
+            day_counts = dt_for_day.dt.date.value_counts()
+            max_obs = int(day_counts.max()) if len(day_counts) else 0
+        else:
+            max_obs = 0
+
+        cand_trades = [v for v in [1, 2, 3, 4, 5] if max_obs == 0 or v <= max(1, max_obs)]
+        cand_losses = [1, 2, 3, 4]
+
+        min_days_rule = 5  # antes estaba muy alto; con n≥5 ya se puede sugerir algo
+
+        def _best_rule(kind, candidates):
+            results = []
+            for val in candidates:
+                if kind == "max_trades":
+                    sim_df, stops_df = _simulate_daily_rules(
+                        base, max_loss=0, max_profit=0, max_trades=val, max_consec_losses=0,
+                        stop_big_loss=False, stop_big_win=False
+                    )
+                    label = f"Máx trades/día = {val}"
+                else:
+                    sim_df, stops_df = _simulate_daily_rules(
+                        base, max_loss=0, max_profit=0, max_trades=0, max_consec_losses=val,
+                        stop_big_loss=False, stop_big_win=False
+                    )
+                    label = f"Máx pérdidas seguidas = {val}"
+
+                sim_pnl = float(pd.to_numeric(sim_df["tradeRealized"], errors="coerce").fillna(0).sum()) if (sim_df is not None and not sim_df.empty and "tradeRealized" in sim_df.columns) else 0.0
+                dd_sim = _dd_mag_from_df(sim_df) if (sim_df is not None and not sim_df.empty) else np.nan
+
+                delta_pnl = sim_pnl - base_pnl
+                mejora_dd = (dd_base - dd_sim) if (not np.isnan(dd_base) and not np.isnan(dd_sim)) else np.nan
+
+                days_cut = 0
+                if stops_df is not None and not stops_df.empty and "fecha" in stops_df.columns:
+                    days_cut = int(pd.to_datetime(stops_df["fecha"], errors="coerce").dt.date.nunique())
+
+                # score ponderado simple (mismo signo: mejor)
+                score = delta_pnl + (0.35 * (mejora_dd if not np.isnan(mejora_dd) else 0.0))
+                results.append((score, days_cut, label, delta_pnl, mejora_dd))
+
+            # elige el mejor score; si hay empate, el que se activó más días
+            results.sort(key=lambda r: (r[0], r[1]), reverse=True)
+            best = results[0] if results else None
+            return best
+
+        # Máx trades/día
+        best_tr = _best_rule("max_trades", cand_trades)
+        if best_tr:
+            score, days_cut, label, delta_pnl, mejora_dd = best_tr
+            if days_cut < min_days_rule:
+                out["rules"].append(("🎛️ Máx trades/día", f"{label}: no concluyente (activada {days_cut} días)."))
+            else:
+                quad = "Mejora PnL y DD" if (delta_pnl > 0 and (not np.isnan(mejora_dd) and mejora_dd > 0)) \
+                       else "Mejora PnL pero empeora DD" if (delta_pnl > 0) \
+                       else "Reduce DD pero cuesta PnL" if (not np.isnan(mejora_dd) and mejora_dd > 0) \
+                       else "Empeora PnL y DD"
+                out["rules"].append((
+                    "🎛️ Máx trades/día",
+                    f"{label} → {quad} (ΔPnL {delta_pnl:+.0f}, ΔDD {mejora_dd:+.0f}, días={days_cut})."
+                ))
+
+        # Máx pérdidas seguidas
+        best_ls = _best_rule("max_losses", cand_losses)
+        if best_ls:
+            score, days_cut, label, delta_pnl, mejora_dd = best_ls
+            if days_cut < min_days_rule:
+                out["rules"].append(("🧯 Máx pérdidas seguidas", f"{label}: no concluyente (activada {days_cut} días)."))
+            else:
+                quad = "Mejora PnL y DD" if (delta_pnl > 0 and (not np.isnan(mejora_dd) and mejora_dd > 0)) \
+                       else "Mejora PnL pero empeora DD" if (delta_pnl > 0) \
+                       else "Reduce DD pero cuesta PnL" if (not np.isnan(mejora_dd) and mejora_dd > 0) \
+                       else "Empeora PnL y DD"
+                out["rules"].append((
+                    "🧯 Máx pérdidas seguidas",
+                    f"{label} → {quad} (ΔPnL {delta_pnl:+.0f}, ΔDD {mejora_dd:+.0f}, días={days_cut})."
+                ))
+
+    return out
 
 def _apply_filters(df_in: pd.DataFrame):
     """
@@ -2131,7 +2230,7 @@ def _apply_filters(df_in: pd.DataFrame):
         is_short = dnum < 0
         is_unknown = dnum.isna() | (dnum == 0)
 
-        dir_opts = ["Compra", "Venta", "No definida"]
+        dir_opts = ["Venta", "Compra", "No definida"]
         dir_default = st.session_state.get("lab_dirs_allowed", dir_opts) or []
         dir_default = [x for x in dir_default if x in dir_opts]
         if not dir_default:
@@ -2519,68 +2618,37 @@ with lab_left:
     st.markdown("---")
     st.markdown("**🧭 Sugerencias rápidas (según tu historial real)**")
     sugg = _lab_quick_suggestions(t)
-    if not sugg:
-        st.info("No hay suficientes datos para sugerir reglas (o faltan timestamps/PnL).")
+
+    st.markdown("#### 🧰 Filtros sugeridos (entrada) (Horas / Dirección / OR / ATR)")
+    if sugg.get("filters"):
+        for title, msg in sugg["filters"]:
+            st.markdown(f"- {title}: {msg}")
     else:
-        # Valores "sin recortar" (sirven como baseline 1:1 aunque actives la regla)
-        if ("max_intraday_loss" in sugg) or ("max_intraday_profit" in sugg):
-            loss0 = sugg.get("max_intraday_loss", 0.0)
-            prof0 = sugg.get("max_intraday_profit", 0.0)
-            st.caption(f"Baseline 1:1: para que las reglas NO corten nada, usa Max pérdida/día ≈ **{loss0:,.0f}** y Max ganancia/día ≈ **{prof0:,.0f}** (o deja 0 = sin límite).")
+        st.caption("No concluyente: no hubo suficiente muestra para sugerir filtros.")
 
-        st.markdown("#### 🧰 Filtros sugeridos (entrada)")
-        best_h = sugg.get("best_hour")
-        worst_h = sugg.get("worst_hour")
-        if (best_h is not None) and (worst_h is not None):
-            st.write(f"🕒 Mejor hora: **{_hour_label(best_h)}** | Peor: **{_hour_label(worst_h)}** (solo celdas con n ≥ 5).")
-        else:
-            st.caption("🕒 Horas: no concluyente (necesitas celdas con n ≥ 5 por bloque horario).")
+    st.markdown("#### 🎛️ Reglas sugeridas (Daily Guard) (Máx trades/día / Máx pérdidas seguidas)")
+    if sugg.get("rules"):
+        for title, msg in sugg["rules"]:
+            st.markdown(f"- {title}: {msg}")
+    else:
+        st.caption("No concluyente: no hubo suficiente muestra para sugerir reglas.")
 
-        if "dir_stats" in sugg and hasattr(sugg["dir_stats"], "empty") and not sugg["dir_stats"].empty:
-            ds = sugg["dir_stats"]
-            try:
-                long_mean  = float(ds.loc["Compra","mean"]) if "Compra" in ds.index else np.nan
-                short_mean = float(ds.loc["Venta","mean"]) if "Venta" in ds.index else np.nan
-                st.write(f"📊 Compra avg: **{long_mean:,.0f}** | Venta avg: **{short_mean:,.0f}** (por trade).")
-                if np.isfinite(long_mean) and np.isfinite(short_mean):
-                    if long_mean > 0 and short_mean < 0:
-                        st.warning("➡️ Considera filtrar **solo Compra** en el Lab y ver el impacto.", icon="⚠️")
-                    elif short_mean > 0 and long_mean < 0:
-                        st.warning("⬅️ Considera filtrar **solo Venta** en el Lab y ver el impacto.", icon="⚠️")
-            except Exception:
-                pass
-        else:
-            st.caption("📊 Dirección: no concluyente (faltan ENTRY o hay poca muestra).")
+    # Referencia: qué valores NO cortan nada en tu histórico real (sirve como 'reset mental')
+    _dt_for_day = None
+    if "entry_time" in t.columns and pd.api.types.is_datetime64_any_dtype(t["entry_time"]):
+        _dt_for_day = t["entry_time"]
+    elif "exit_time" in t.columns and pd.api.types.is_datetime64_any_dtype(t["exit_time"]):
+        _dt_for_day = t["exit_time"]
 
-        # OR/ATR suggestions (informativo)
-        osug = sugg.get("or_suggestion")
-        if isinstance(osug, dict):
-            st.write(f"🧱 OR sugerido: **{osug.get('best_range', '—')}** (PF {osug.get('best_pf', np.nan):.2f}, n={osug.get('best_n', 0)}) | evitar **{osug.get('worst_range', '—')}** (PF {osug.get('worst_pf', np.nan):.2f}, n={osug.get('worst_n', 0)}).")
-        asug = sugg.get("atr_suggestion")
-        if isinstance(asug, dict):
-            st.write(f"📏 ATR sugerido: **{asug.get('best_range', '—')}** (PF {asug.get('best_pf', np.nan):.2f}, n={asug.get('best_n', 0)}) | evitar **{asug.get('worst_range', '—')}** (PF {asug.get('worst_pf', np.nan):.2f}, n={asug.get('worst_n', 0)}).")
-
-        st.markdown("#### 🎛️ Reglas sugeridas (Daily Guard)")
-        rec_mt = sugg.get("rec_max_trades")
-        if rec_mt is not None:
-            st.write(f"🏁 Máx trades/día sugerido: **{int(rec_mt)}** (en tu muestra, más trades no mejoró el PnL mediano diario).")
-        else:
-            st.caption("🏁 Máx trades/día: no concluyente (muestra insuficiente).")
-        rec_streak = sugg.get("rec_max_consec_losses")
-        if rec_streak is not None:
-            st.write(f"🧯 Máx pérdidas seguidas sugerido: **{int(rec_streak)}** (para cortar rachas malas).")
-        else:
-            st.caption("🧯 Máx pérdidas seguidas: no concluyente (muestra insuficiente).")
-        # RR-based suggestions
-        if "after_stopout" in sugg:
-            med, n = sugg["after_stopout"]
-            if n >= 5 and np.isfinite(med) and med < 0:
-                st.warning(f"🧯 Tras un stop-out fuerte (RR≤-1), el resto del día tiende a ser negativo (mediana {med:,.0f}, n={n}). Prueba activar esa regla.", icon="⚠️")
-        if "after_bigwin" in sugg:
-            med, n = sugg["after_bigwin"]
-            if n >= 5 and np.isfinite(med) and med < 0:
-                st.warning(f"🏆 Tras un ganador grande (RR≥2), suele haber devolución (mediana resto {med:,.0f}, n={n}). Prueba activar esa regla.", icon="⚠️")
-
+    if _dt_for_day is not None and "tradeRealized" in t.columns:
+        _daily = t.copy()
+        _daily["__day"] = _dt_for_day.dt.date
+        _daily["__pnl"] = pd.to_numeric(_daily["tradeRealized"], errors="coerce").fillna(0)
+        _day_pnl = _daily.groupby("__day")["__pnl"].sum()
+        if len(_day_pnl) > 0:
+            _max_loss = float(abs(_day_pnl.min())) if _day_pnl.min() < 0 else 0.0
+            _max_profit = float(_day_pnl.max()) if _day_pnl.max() > 0 else 0.0
+            st.caption(f"Referencia: para no cortar nada, usa Máx pérdida/día = {_max_loss:.0f} y Máx ganancia/día = {_max_profit:.0f}.")
 with lab_right:
     st.markdown("**Filtros (opcional)**")
     base_for_lab = t.copy()  # <-- mismo universo que Resumen rápido
