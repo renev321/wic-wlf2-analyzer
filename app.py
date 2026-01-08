@@ -2158,6 +2158,157 @@ def _apply_filters(df_in: pd.DataFrame):
         df = df[~bad].copy()
 
     return df, notes
+
+
+# ============================================================
+# Lab: simulación de reglas diarias (Daily Guard "what-if")
+# ============================================================
+def _simulate_daily_rules(df: pd.DataFrame,
+                          max_loss: float = 0.0,
+                          max_profit: float = 0.0,
+                          max_trades: int = 0,
+                          max_consec_losses: int = 0,
+                          stop_big_loss: bool = False,
+                          stop_big_win: bool = False):
+    """Simula reglas diarias sobre un DataFrame de trades.
+
+    Devuelve:
+      - kept_df: trades que "habrían ocurrido" con esas reglas
+      - stops_df: 1 fila por día donde se activó un corte (motivo + cuántos trades se omitieron)
+
+    Reglas (si valor == 0 / False => no aplica):
+      - max_loss: corta si PnL acumulado del día <= -max_loss
+      - max_profit: corta si PnL acumulado del día >= max_profit
+      - max_trades: corta tras ejecutar N trades en el día
+      - max_consec_losses: corta tras N pérdidas seguidas
+      - stop_big_loss: corta tras un trade con RR <= -1
+      - stop_big_win: corta tras un trade con RR >= 2
+
+    Nota:
+      - Se ordena por entry_time si existe; si no, por exit_time.
+      - Trades sin timestamp no se pueden asignar a un día: se dejan pasar (no se recortan).
+    """
+    if df is None or df.empty:
+        return (df.copy() if df is not None else pd.DataFrame()), pd.DataFrame()
+
+    work = df.copy()
+
+    time_col = "entry_time" if "entry_time" in work.columns else ("exit_time" if "exit_time" in work.columns else None)
+    if time_col is None:
+        # Sin tiempo no podemos simular "por día"
+        return work, pd.DataFrame()
+
+    # Asegurar datetime
+    if not np.issubdtype(work[time_col].dtype, np.datetime64):
+        work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
+
+    with_time = work[work[time_col].notna()].copy()
+    no_time = work[work[time_col].isna()].copy()
+
+    if with_time.empty:
+        return work, pd.DataFrame()
+
+    with_time = with_time.sort_values(time_col)
+    with_time["day"] = with_time[time_col].dt.date
+
+    kept_idx = []
+    stop_rows = []
+
+    # Prioridad cuando varias reglas se disparan en el mismo trade
+    def _pick_motivo(candidates):
+        priority = [
+            "Max pérdida/día",
+            "Max ganancia/día",
+            "Máx trades/día",
+            f"{max_consec_losses} pérdidas seguidas" if max_consec_losses > 0 else None,
+            "Stop‑out fuerte (≤ -1R)",
+            "Cierre tras ganador grande (≥ 2R)",
+        ]
+        priority = [p for p in priority if p is not None]
+        for p in priority:
+            if p in candidates:
+                return p
+        return candidates[0] if candidates else "Regla"
+
+    for d, sub in with_time.groupby("day", sort=False):
+        pnl_cum = 0.0
+        consec_losses = 0
+        executed = 0
+        stopped = False
+
+        rows = sub.to_dict("records")
+        for i, r in enumerate(rows):
+            # "Ejecutamos" este trade
+            executed += 1
+            idx = sub.index[i]
+            kept_idx.append(idx)
+
+            pnl = float(r.get("tradeRealized", 0.0) or 0.0)
+            pnl_cum += pnl
+
+            if pnl < 0:
+                consec_losses += 1
+            else:
+                consec_losses = 0
+
+            rr = r.get("rr", np.nan)
+            try:
+                rr = float(rr) if rr is not None else np.nan
+            except Exception:
+                rr = np.nan
+
+            # ¿Alguna regla se activó tras este trade?
+            fired = []
+
+            if max_trades and max_trades > 0 and executed >= int(max_trades):
+                fired.append("Máx trades/día")
+
+            if max_loss and max_loss > 0 and pnl_cum <= -float(max_loss):
+                fired.append("Max pérdida/día")
+
+            if max_profit and max_profit > 0 and pnl_cum >= float(max_profit):
+                fired.append("Max ganancia/día")
+
+            if max_consec_losses and max_consec_losses > 0 and consec_losses >= int(max_consec_losses):
+                fired.append(f"{int(max_consec_losses)} pérdidas seguidas")
+
+            if stop_big_loss and not np.isnan(rr) and rr <= -1.0:
+                fired.append("Stop‑out fuerte (≤ -1R)")
+
+            if stop_big_win and not np.isnan(rr) and rr >= 2.0:
+                fired.append("Cierre tras ganador grande (≥ 2R)")
+
+            if fired and not stopped:
+                motivo = _pick_motivo(fired)
+                trades_omitidos = max(0, len(sub) - executed)
+                stop_rows.append({
+                    "fecha": d,      # compat
+                    "day": d,        # compat
+                    "motivo": motivo,
+                    "trades_ejecutados": executed,
+                    "trades_filtrados_por_stop": trades_omitidos,
+                })
+                stopped = True
+                break
+
+        # si stopped, no añadimos el resto de idx
+        # si no stopped, el loop ya añadió todos
+
+    kept_df = work.loc[kept_idx].copy()
+    # Añadimos los trades sin timestamp (no se pueden cortar por día)
+    if not no_time.empty:
+        kept_df = pd.concat([kept_df, no_time], ignore_index=False)
+
+    # Orden final estable por el mismo time_col (si existe)
+    if time_col in kept_df.columns:
+        try:
+            kept_df = kept_df.sort_values(time_col)
+        except Exception:
+            pass
+
+    stops_df = pd.DataFrame(stop_rows)
+    return kept_df, stops_df
+
 def _reset_lab_state(base_df: pd.DataFrame):
     """Resetea el Lab para que arranque 1:1 con el Resumen rápido (REAL vs SIMULADO sin cortes)."""
     if base_df is None:
