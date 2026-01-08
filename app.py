@@ -2001,19 +2001,50 @@ def _apply_filters(base: pd.DataFrame):
     return df, notes
 def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, max_trades: int,
                           max_consec_losses: int, stop_big_loss: bool, stop_big_win: bool):
+    """Simula reglas diarias sobre el DataFrame ya filtrado.
+
+    Importante:
+    - Si NO hay reglas activas (todos los límites en 0 y toggles en False), devuelve el DF tal cual
+      para que el Lab arranque 1:1 con el Resumen rápido.
+    - Para trades sin entry_time, usa exit_time como fallback (no se pierden del universo).
+    """
     if df is None or df.empty:
         return df, pd.DataFrame()
 
+    # Si no hay reglas, no simules nada: igualdad exacta con la base filtrada
+    rules_active = any([
+        (max_loss and max_loss > 0),
+        (max_profit and max_profit > 0),
+        (max_trades and max_trades > 0),
+        (max_consec_losses and max_consec_losses > 0),
+        bool(stop_big_loss),
+        bool(stop_big_win),
+    ])
+    if not rules_active:
+        return df.copy(), pd.DataFrame()
+
     sim = df.copy()
-    sim = sim[sim["entry_time"].notna()].copy() if "entry_time" in sim.columns else sim.copy()
-    sim = sim.sort_values("entry_time" if "entry_time" in sim.columns else "exit_time").reset_index()
-    sim["entry_date"] = (sim["entry_time"] if "entry_time" in sim.columns else sim["exit_time"]).dt.date
+
+    # Timestamp operativo para ordenar/agrupar (fallback a exit_time si falta entry_time)
+    if "entry_time" in sim.columns and "exit_time" in sim.columns:
+        sim["_lab_ts"] = sim["entry_time"].where(sim["entry_time"].notna(), sim["exit_time"])
+    elif "entry_time" in sim.columns:
+        sim["_lab_ts"] = sim["entry_time"]
+    elif "exit_time" in sim.columns:
+        sim["_lab_ts"] = sim["exit_time"]
+    else:
+        # Sin timestamps no se puede simular reglas por día
+        return df.copy(), pd.DataFrame()
+
+    sim = sim[sim["_lab_ts"].notna()].copy()
+    sim = sim.sort_values("_lab_ts").reset_index()
+    sim["entry_date"] = sim["_lab_ts"].dt.date
 
     kept_rows = []
     stops = []
 
-    for day, sub in sim.groupby("entry_date"):
-        sub = sub.sort_values("entry_time" if "entry_time" in sub.columns else "exit_time")
+    for day, sub in sim.groupby("entry_date", dropna=True):
+        sub = sub.sort_values("_lab_ts")
         pnl_day = 0.0
         consec = 0
         taken = 0
@@ -2023,6 +2054,7 @@ def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, 
         for _, row in sub.iterrows():
             if halted:
                 break
+
             if max_trades > 0 and taken >= max_trades:
                 halted = True
                 stop_reason = "Máx trades/día"
@@ -2041,6 +2073,7 @@ def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, 
             tr = float(row.get("tradeRealized", 0) or 0)
             pnl_day += tr
             taken += 1
+
             if tr < 0:
                 consec += 1
             else:
@@ -2058,6 +2091,7 @@ def _simulate_daily_rules(df: pd.DataFrame, max_loss: float, max_profit: float, 
             if (not halted) and max_consec_losses > 0 and consec >= max_consec_losses:
                 halted = True
                 stop_reason = f"{max_consec_losses} pérdidas seguidas"
+
             if (not halted) and max_loss > 0 and pnl_day <= -abs(max_loss):
                 halted = True
                 stop_reason = "Max pérdida/día"
