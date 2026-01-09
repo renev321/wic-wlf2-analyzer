@@ -2667,6 +2667,7 @@ with st.expander("🚀 Turbo Optimus Presets (A) — PnL / DD / Corr (1 click)",
             "lab_avoid_no_support": bool(ss.get("lab_avoid_no_support", False)),
         }
     
+    df_real = globals().get("t", globals().get("trades", pd.DataFrame()))
     base_preset = _turbo_build_base_preset(df_real)
     
     presets = [("Baseline (1:1)", base_preset)]
