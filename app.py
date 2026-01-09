@@ -2419,7 +2419,7 @@ with lab_left:
 # 🚀 Turbo Presets (A): lista de presets aplicables con 1 click
 # Objetivo: sugerir combinaciones simples (filtros + reglas) y permitir aplicarlas.
 # ─────────────────────────────────────────────────────────────────────────────
-with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=False):
+with st.expander("🚀 Turbo Optimus Presets (A) — PnL / DD / Corr (1 click)", expanded=False):
     st.caption("Se calculan presets rápidos y se ordenan por un puntaje balanceado (ΔPnL + mejora DD). "
                "Cada preset ajusta filtros y/o reglas. Al aplicar, verás el resultado en 'Resultados del Lab'.")
 
@@ -2578,12 +2578,26 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         dd_real  = _dd_mag_from_pnl(pd.to_numeric(df_real.get("tradeRealized"), errors="coerce").fillna(0.0)) if df_real is not None else 0.0
         dd_sim   = _dd_mag_from_pnl(pd.to_numeric(sim_kept.get("tradeRealized"), errors="coerce").fillna(0.0)) if sim_kept is not None and not sim_kept.empty else 0.0
 
+        # Correlation proxy: per-trade PnL vs drawdown depth after each trade (closer to 0 = more stable)
+        corr_pnl_dd = float("nan")
+        if sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns:
+            _pnls = pd.to_numeric(sim_kept["tradeRealized"], errors="coerce").fillna(0.0).to_numpy()
+            _eq = np.cumsum(_pnls)
+            _peak = np.maximum.accumulate(_eq)
+            _dd_depth = _eq - _peak
+            corr_pnl_dd = _safe_corr(_pnls, _dd_depth)
+
+
         # PF
         pf_sim = profit_factor(sim_kept["tradeRealized"]) if (sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns) else np.nan
 
         delta_pnl = pnl_sim - pnl_real
         mejora_dd = dd_real - dd_sim  # positivo = reduce drawdown
         score_bal = delta_pnl + mejora_dd
+
+        # Tuned score = balanced score with a penalty for high |corr_pnl_dd|
+        score_tuned = score_bal - (5000.0 * abs(corr_pnl_dd) if np.isfinite(corr_pnl_dd) else 0.0)
+
 
         return {
             "pnl_sim": pnl_sim,
@@ -2594,6 +2608,8 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
             "delta_pnl": delta_pnl,
             "mejora_dd": mejora_dd,
             "score_bal": score_bal,
+            "corr_pnl_dd": corr_pnl_dd,
+            "score_tuned": score_tuned,
         }
 
     def _preset_summary(params: dict) -> str:
@@ -2615,104 +2631,303 @@ with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=Fals
         return " | ".join(parts) if parts else "sin cambios"
 
     # --- Construir presets ---
-    df_real = t.copy()
+    presets = [("Baseline (1:1)", base_preset)]
 
-    # límites base para sliders (si existen)
-    or_col  = _infer_col(df_real, ["orSize","or_size","or","orPoints"])
-    atr_col = _infer_col(df_real, ["atr","ATR","atrPoints"])
-    or_min, or_max = (float(pd.to_numeric(df_real[or_col], errors="coerce").min()), float(pd.to_numeric(df_real[or_col], errors="coerce").max())) if or_col else (None,None)
-    atr_min, atr_max = (float(pd.to_numeric(df_real[atr_col], errors="coerce").min()), float(pd.to_numeric(df_real[atr_col], errors="coerce").max())) if atr_col else (None,None)
+    # Guardrails simples (rápidos)
+    presets.append(("🧯 Stop-Guard (max loss + consec loss)", {**base_preset, "lab_max_loss": 600, "lab_max_consec_losses": 2, "lab_stop_big_loss": True}))
+    presets.append(("🧯 Stop-Guard (max loss más estricto)", {**base_preset, "lab_max_loss": 400, "lab_max_consec_losses": 2, "lab_stop_big_loss": True}))
+    presets.append(("🎯 Take-Profit Guard (max profit)", {**base_preset, "lab_max_profit": 600, "lab_stop_big_win": True}))
 
-    # horas presentes
-    hour_col = _infer_col(df_real, ["entry_hour","hour","entryHour"])
-    hours_present = sorted([int(h) for h in pd.Series(df_real[hour_col]).dropna().unique().tolist()]) if hour_col else []
-    all_hour_labels = [_hour_block_label(h) for h in hours_present] if hours_present else []
+    # Sugerencias simples por 1 dimensión (hora / OR / ATR)
+    if hours_present:
+        best_h = hours_present[0]
+        presets.append((f"⏱️ Mejor hora ({_hour_block_label(best_h)})", {**base_preset, "lab_hours_allowed": [_hour_block_label(best_h)]}))
 
-    base_preset = {
-        "lab_max_loss": 0.0,
-        "lab_max_profit": 0.0,
-        "lab_max_trades": 0,
-        "lab_max_consec_losses": 0,
-        "lab_stop_big_loss": False,
-        "lab_stop_big_win": False,
-        "lab_include_missing": True,
-        "lab_dirs_allowed": ["Compra","Venta","No definida"],
-        "lab_hours_allowed": all_hour_labels,
-    }
-    if or_min is not None:
-        base_preset["lab_or_rng"] = (or_min, or_max)
-    if atr_min is not None:
-        base_preset["lab_atr_rng"] = (atr_min, atr_max)
+    if or_present is not None and len(or_present) > 5:
+        bins_or = _best_bin_for_metric(or_present, df_real, "lab_or_rng")
+        if bins_or is not None:
+            presets.append((f"📦 Mejor bin OR ({bins_or[0]:.2f}-{bins_or[1]:.2f})", {**base_preset, "lab_or_rng": bins_or}))
 
-    # sugerencias simples desde datos
-    best_h = _best_hour(df_real, min_n=5)
-    best_or = _pick_best_bin(df_real, or_col, q=4, min_n=25) if or_col else None
-    best_atr = _pick_best_bin(df_real, atr_col, q=4, min_n=25) if atr_col else None
+    if atr_present is not None and len(atr_present) > 5:
+        bins_atr = _best_bin_for_metric(atr_present, df_real, "lab_atr_rng")
+        if bins_atr is not None:
+            presets.append((f"🌡️ Mejor bin ATR ({bins_atr[0]:.2f}-{bins_atr[1]:.2f})", {**base_preset, "lab_atr_rng": bins_atr}))
 
-    presets=[]
-    presets.append(("Baseline (1:1)", base_preset))
-    presets.append(("DailyGuard: máx trades = 3", {**base_preset, "lab_max_trades": 3}))
-    presets.append(("DailyGuard: 2 pérdidas seguidas = 2", {**base_preset, "lab_max_consec_losses": 2}))
-    presets.append(("DailyGuard: máx pérdida/día = 600", {**base_preset, "lab_max_loss": 600.0}))
-    if best_h:
-        presets.append((f"Filtro: mejor hora ({best_h})", {**base_preset, "lab_hours_allowed": [best_h]}))
-    if best_or:
-        lo,hi,pf,n = best_or
-        presets.append((f"Filtro: OR sugerido ({lo:.2f}–{hi:.2f})", {**base_preset, "lab_or_rng": (lo,hi)}))
-    if best_atr:
-        lo,hi,pf,n = best_atr
-        presets.append((f"Filtro: ATR sugerido ({lo:.2f}–{hi:.2f})", {**base_preset, "lab_atr_rng": (lo,hi)}))
-    # combo
-    combo = dict(base_preset)
-    combo["lab_max_trades"] = 3
-    if best_h:
-        combo["lab_hours_allowed"] = [best_h]
-    if best_or:
-        combo["lab_or_rng"] = (best_or[0], best_or[1])
-    if best_atr:
-        combo["lab_atr_rng"] = (best_atr[0], best_atr[1])
-    presets.append(("Combo (horas + OR + ATR + max trades)", combo))
+    st.markdown("#### ⚡ Optimus presets (combinaciones Time + OR + ATR + Risk)\n""Esto **sí** busca combinaciones (in-sample) para **subir PnL**, **bajar DD** y mejorar una métrica de **estabilidad (|corr|)**.\n""No es garantía de futuro — pero te da *presets listos* para probar en tus experimentos.")
 
-    # --- Evaluar presets ---
-    rows=[]
-    for name, prm in presets:
-        try:
-            r=_turbo_eval_preset(df_real, prm)
-            r["preset"]=name
-            r["resumen"]=_preset_summary(prm)
-            rows.append(r)
-        except Exception:
-            continue
-    if rows:
-        dfp = pd.DataFrame(rows)
-        order_mode = st.selectbox(
-            "Ordenar presets por",
-            ["Puntaje balanceado (ΔPnL + mejora DD) (recomendado)", "ΔPnL (solo)", "Mejora DD (solo)", "PF sim (solo)"],
-            index=0,
-            key="turbo_order_mode"
-        )
-        if order_mode.startswith("ΔPnL"):
-            dfp = dfp.sort_values("delta_pnl", ascending=False)
-        elif order_mode.startswith("Mejora"):
-            dfp = dfp.sort_values("mejora_dd", ascending=False)
-        elif order_mode.startswith("PF"):
-            dfp = dfp.sort_values("pf_sim", ascending=False)
+    c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.0, 1.2])
+    with c1:
+        turbo_depth = st.selectbox("Intensidad", ["Lite", "Normal", "Max"], index=1, key="turbo_depth")
+    with c2:
+        min_trades_opt = st.number_input("Min trades", min_value=5, max_value=500, value=30, step=5, key="turbo_min_trades")
+    with c3:
+        max_presets_out = st.number_input("Top presets", min_value=5, max_value=30, value=12, step=1, key="turbo_topn")
+    with c4:
+        auto_run = st.checkbox("Auto-calcular Optimus", value=True, key="turbo_auto")
+
+    def _quantile_ranges(x, q=6):
+        x = pd.to_numeric(pd.Series(x), errors="coerce").dropna()
+        if len(x) < 10:
+            return []
+        qs = np.unique(np.quantile(x, np.linspace(0, 1, q + 1)))
+        if len(qs) < 3:
+            return []
+        rngs = []
+        for i in range(len(qs) - 1):
+            lo, hi = float(qs[i]), float(qs[i + 1])
+            if hi > lo:
+                rngs.append((lo, hi))
+        return rngs
+
+    def _pick_top_ranges(ranges, base_params, key_name, top_k, sort_mode):
+        scored = []
+        for lo, hi in ranges:
+            p = dict(base_params)
+            p[key_name] = (lo, hi)
+            r = _turbo_eval_preset(df_real, p)
+            if r is None or r.get("trades_sim", 0) < min_trades_opt:
+                continue
+            dd_mag = _dd_mag_from_pnl(r.get("dd_sim", 0.0))
+            if sort_mode == "pnl":
+                score = r.get("pnl_sim", 0.0)
+            elif sort_mode == "dd":
+                score = -dd_mag
+            else:
+                score = r.get("score_tuned", r.get("score_bal", 0.0))
+            scored.append((score, (lo, hi)))
+        scored.sort(key=lambda z: z[0], reverse=True)
+        return [rng for _, rng in scored[:top_k]]
+
+    def _build_hours_candidates(top_h=6):
+        if not hours_present:
+            return [None]
+        # ranking simple por PnL (sin filtros adicionales)
+        scored = []
+        for h in hours_present:
+            p = dict(base_preset)
+            p["lab_hours_allowed"] = [_hour_block_label(h)]
+            r = _turbo_eval_preset(df_real, p)
+            if r is None or r.get("trades_sim", 0) < min_trades_opt:
+                continue
+            scored.append((r.get("pnl_sim", 0.0), _hour_block_label(h)))
+        scored.sort(key=lambda z: z[0], reverse=True)
+        top_labels = [lab for _, lab in scored[:top_h]]
+        hours_sets = [None] + [[lab] for lab in top_labels]
+        # combos de 2 horas (solo si hay suficiente)
+        if len(top_labels) >= 2:
+            hours_sets += [[top_labels[0], top_labels[1]]]
+        return hours_sets
+
+    def _optimus_search(depth):
+        base_eval = _turbo_eval_preset(df_real, base_preset)
+        if base_eval is None:
+            return []
+        dd_base = _dd_mag_from_pnl(base_eval.get("dd_sim", 0.0))
+
+        if depth == "Lite":
+            top_h, top_or, top_atr = 4, 3, 3
+            max_trades_list = [0, 2, 3]
+            max_consec_list = [0, 2]
+            max_loss_list = [0, 600]
+        elif depth == "Max":
+            top_h, top_or, top_atr = 8, 6, 6
+            max_trades_list = [0, 2, 3, 4, 5]
+            max_consec_list = [0, 2, 3, 4]
+            max_loss_list = [0, 400, 600, 800, 1000]
         else:
-            dfp = dfp.sort_values("score_bal", ascending=False)
+            top_h, top_or, top_atr = 6, 4, 4
+            max_trades_list = [0, 2, 3, 4]
+            max_consec_list = [0, 2, 3]
+            max_loss_list = [0, 600, 1000]
 
-        show = dfp[["preset","resumen","delta_pnl","mejora_dd","trades_sim","pf_sim"]].copy()
-        show.rename(columns={"delta_pnl":"ΔPnL vs real ($)", "mejora_dd":"Mejora DD ($)", "trades_sim":"Trades sim", "pf_sim":"PF sim"}, inplace=True)
-        st.dataframe(show, use_container_width=True, hide_index=True)
+        hour_sets = _build_hours_candidates(top_h=top_h)
 
-        sel = st.selectbox("Aplicar preset", show["preset"].tolist(), key="turbo_sel_preset")
-        if st.button("✅ Aplicar preset seleccionado", key="turbo_apply_btn"):
-            preset_dict = dict(presets)[sel]
-            # aplicar a session_state
-            for k,v in preset_dict.items():
-                st.session_state[k]=v
-            st.rerun()
+        or_ranges_all = _quantile_ranges(or_present, q=max(4, top_or)) if or_present is not None else []
+        atr_ranges_all = _quantile_ranges(atr_present, q=max(4, top_atr)) if atr_present is not None else []
+
+        # escoger top bins por score tuned (más robusto)
+        or_ranges = _pick_top_ranges(or_ranges_all, base_preset, "lab_or_rng", top_or, sort_mode="tuned") if or_ranges_all else [None]
+        atr_ranges = _pick_top_ranges(atr_ranges_all, base_preset, "lab_atr_rng", top_atr, sort_mode="tuned") if atr_ranges_all else [None]
+
+        candidates = []
+        for hs in hour_sets:
+            for or_rng in or_ranges:
+                for atr_rng in atr_ranges:
+                    for mt in max_trades_list:
+                        for mcl in max_consec_list:
+                            for ml in max_loss_list:
+                                p = dict(base_preset)
+                                if hs is not None:
+                                    p["lab_hours_allowed"] = hs
+                                if or_rng is not None:
+                                    p["lab_or_rng"] = or_rng
+                                if atr_rng is not None:
+                                    p["lab_atr_rng"] = atr_rng
+                                if mt > 0:
+                                    p["lab_max_trades"] = int(mt)
+                                if mcl > 0:
+                                    p["lab_max_consec_losses"] = int(mcl)
+                                if ml > 0:
+                                    p["lab_max_loss"] = float(ml)
+                                    p["lab_stop_big_loss"] = True
+                                candidates.append(p)
+
+        # cap (para no explotar)
+        cap = 250 if depth == "Lite" else (900 if depth == "Normal" else 2000)
+        if len(candidates) > cap:
+            _rng = np.random.default_rng(7)
+            _idxs = _rng.choice(len(candidates), size=cap, replace=False)
+            candidates = [candidates[int(i)] for i in _idxs]
+
+        scored = []
+        for p in candidates:
+            r = _turbo_eval_preset(df_real, p)
+            if r is None:
+                continue
+            n = int(r.get("trades_sim", 0))
+            if n < int(min_trades_opt):
+                continue
+            pnl = float(r.get("pnl_sim", 0.0))
+            dd  = float(r.get("dd_sim", 0.0))
+            dd_mag = _dd_mag_from_pnl(dd)
+            corr = r.get("corr_pnl_dd", float('nan'))
+            score_tuned = float(r.get("score_tuned", r.get("score_bal", 0.0)))
+            scored.append({"p": p, "pnl": pnl, "dd": dd, "dd_mag": dd_mag, "corr": corr, "score_tuned": score_tuned, "n": n})
+
+        if not scored:
+            return []
+
+        # constraints suaves para evitar 'PnL a cualquier costo'
+        dd_cap = dd_base * 1.35 if dd_base > 0 else float('inf')
+
+        rocket_pool = [x for x in scored if x["dd_mag"] <= dd_cap]
+        if not rocket_pool:
+            rocket_pool = scored
+        best_rocket = max(rocket_pool, key=lambda x: x["pnl"])
+
+        sub_pool = [x for x in scored if x["pnl"] >= max(0.0, base_eval.get("pnl_sim", 0.0) * 0.25)]
+        if not sub_pool:
+            sub_pool = scored
+        best_sub = min(sub_pool, key=lambda x: x["dd_mag"])
+
+        best_tuned = max(scored, key=lambda x: x["score_tuned"])
+
+        # Top adicionales (tuned)
+        scored_sorted = sorted(scored, key=lambda x: x["score_tuned"], reverse=True)
+        extras = scored_sorted[:int(max_presets_out)]
+
+        def _label(x, tag):
+            pnl = x["pnl"]; dd = x["dd"]; corr = x["corr"]; n = x["n"]
+            corr_txt = "" if not np.isfinite(corr) else f" |corr|={abs(corr):.2f}"
+            return f"{tag} PnL={pnl:,.0f}  DD={dd:,.0f}  (n={n}){corr_txt}"
+
+        out = []
+        out.append((_label(best_rocket, "🚀 Rocket"), best_rocket["p"]))
+        out.append((_label(best_sub, "🛟 Submarine"), best_sub["p"]))
+        out.append((_label(best_tuned, "🎛️ Tuned"), best_tuned["p"]))
+
+        # extras (evitar duplicados)
+        seen = {id(best_rocket["p"]), id(best_sub["p"]), id(best_tuned["p"])}
+        for x in extras:
+            if len(out) >= int(max_presets_out):
+                break
+            out.append((_label(x, "⚡ Optimus"), x["p"]))
+        return out
+
+    optimus_presets = []
+    if auto_run:
+        optimus_presets = _optimus_search(turbo_depth)
     else:
-        st.info("No se pudieron calcular presets (muestra insuficiente o faltan columnas).")
+        if st.button("🔍 Calcular Optimus ahora", key="turbo_run_now"):
+            optimus_presets = _optimus_search(turbo_depth)
+
+    if optimus_presets:
+        presets.extend(optimus_presets)
+    else:
+        st.caption("Optimus: no hubo resultados con suficientes trades (sube 'Min trades' o usa 'Lite').")
+    # --- Evaluar presets ---
+    show = []
+    for label, params in presets:
+        r = _turbo_eval_preset(df_real, params)
+        if r is None:
+            continue
+        show.append({
+            "Preset": label,
+            "pnl_sim": r.get("pnl_sim", float('nan')),
+            "dd_sim": r.get("dd_sim", float('nan')),
+            "pf_sim": r.get("pf_sim", float('nan')),
+            "trades_sim": r.get("trades_sim", 0),
+            "omitidos_filt": r.get("omitidos_filt", 0),
+            "delta_pnl": r.get("delta_pnl", float('nan')),
+            "mejora_dd": r.get("mejora_dd", float('nan')),
+            "score_bal": r.get("score_bal", float('nan')),
+            "corr_pnl_dd": r.get("corr_pnl_dd", float('nan')),
+            "score_tuned": r.get("score_tuned", float('nan')),
+            "_params": params,
+        })
+
+    if not show:
+        st.info("No hay presets evaluables (quizás no hay trades suficientes / faltan columnas).")
+    else:
+        show = pd.DataFrame(show)
+        show["dd_mag"] = show["dd_sim"].apply(_dd_mag_from_pnl)
+        show["abs_corr"] = show["corr_pnl_dd"].apply(lambda x: abs(x) if np.isfinite(x) else float('nan'))
+
+        # Highlights (1 por objetivo)
+        best_rocket = show.sort_values("pnl_sim", ascending=False).iloc[0]
+        best_sub = show.sort_values("dd_mag", ascending=True).iloc[0]
+        best_tuned = show.sort_values("score_tuned", ascending=False).iloc[0]
+
+        h1, h2, h3 = st.columns(3)
+        with h1:
+            st.metric("🚀 Rocket (PnL)", f"{best_rocket['pnl_sim']:,.0f}", f"DD {best_rocket['dd_sim']:,.0f}")
+            st.caption(_describe_preset(best_rocket["_params"]))
+        with h2:
+            st.metric("🛟 Submarine (DD)", f"{best_sub['dd_sim']:,.0f}", f"PnL {best_sub['pnl_sim']:,.0f}")
+            st.caption(_describe_preset(best_sub["_params"]))
+        with h3:
+            st.metric("🎛️ Tuned (PnL+DD+Corr)", f"{best_tuned['score_tuned']:,.0f}", f"PnL {best_tuned['pnl_sim']:,.0f} | DD {best_tuned['dd_sim']:,.0f}")
+            st.caption(_describe_preset(best_tuned["_params"]))
+
+        order_mode = st.selectbox(
+            "Ordenar por",
+            ["🎛️ Tuned (PnL + DD + Corr)", "🚀 Mejor PnL", "🛟 Menor DD (magnitud)", "⚖️ Balance (ΔPnL + mejora DD)"],
+            key="turbo_order_mode",
+        )
+
+        if order_mode.startswith("🚀"):
+            show = show.sort_values("pnl_sim", ascending=False)
+        elif order_mode.startswith("🛟"):
+            show = show.sort_values("dd_mag", ascending=True)
+        elif order_mode.startswith("🎛️"):
+            show = show.sort_values("score_tuned", ascending=False)
+        else:
+            show = show.sort_values("score_bal", ascending=False)
+
+        show_disp = show.drop(columns=["_params"])
+        show_disp = show_disp.rename(columns={
+            "pnl_sim": "PnL sim ($)",
+            "dd_sim": "Max DD sim ($)",
+            "pf_sim": "PF sim",
+            "trades_sim": "Trades sim",
+            "omitidos_filt": "Omitidos por filtros",
+            "delta_pnl": "ΔPnL vs real ($)",
+            "mejora_dd": "Mejora DD vs real ($)",
+            "score_bal": "Score balance",
+            "corr_pnl_dd": "Corr(PnL,DD)",
+            "score_tuned": "Score tuned",
+            "dd_mag": "|DD|",
+            "abs_corr": "|corr|",
+        })
+        st.dataframe(show_disp, use_container_width=True, hide_index=True)
+
+        sel = st.selectbox("Aplicar preset", options=show["Preset"].tolist(), key="turbo_sel_preset")
+        if st.button("✅ Aplicar", key="turbo_apply_btn"):
+            chosen = show.loc[show["Preset"] == sel].iloc[0]
+            for k, v in chosen["_params"].items():
+                st.session_state[k] = v
+            st.success(f"Preset aplicado: {sel}")
+            st.rerun()
 with lab_right:
     st.markdown("**Filtros (opcional)**")
     base_for_lab = t.copy()  # <-- mismo universo que Resumen rápido
