@@ -2415,6 +2415,304 @@ with lab_left:
             if n >= 5 and np.isfinite(med) and med < 0:
                 st.warning(f"🏆 Tras un ganador grande (RR≥2), suele haber devolución (mediana resto {med:,.0f}, n={n}). Prueba activar esa regla.", icon="⚠️")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🚀 Turbo Presets (A): lista de presets aplicables con 1 click
+# Objetivo: sugerir combinaciones simples (filtros + reglas) y permitir aplicarlas.
+# ─────────────────────────────────────────────────────────────────────────────
+with st.expander("🚀 Turbo Presets (A) — aplicar con 1 click", expanded=False):
+    st.caption("Se calculan presets rápidos y se ordenan por un puntaje balanceado (ΔPnL + mejora DD). "
+               "Cada preset ajusta filtros y/o reglas. Al aplicar, verás el resultado en 'Resultados del Lab'.")
+
+    # --- Helpers (sin widgets) ---
+    def _dd_mag_from_pnl(pnl_series: pd.Series) -> float:
+        try:
+            s = pd.to_numeric(pnl_series, errors="coerce").fillna(0.0)
+            if s.empty:
+                return 0.0
+            eq = s.cumsum()
+            peak = eq.cummax()
+            dd = eq - peak
+            return float((-dd.min()) if len(dd) else 0.0)
+        except Exception:
+            return 0.0
+
+    def _infer_col(df_: pd.DataFrame, candidates):
+        for c in candidates:
+            if c in df_.columns:
+                return c
+        return None
+
+    def _lab_filter_df_params(df_: pd.DataFrame, params: dict) -> pd.DataFrame:
+        d = df_.copy()
+
+        include_missing = bool(params.get("lab_include_missing", True))
+
+        # Dirección
+        dir_col = _infer_col(d, ["dir_label", "dir", "direction", "tradeDirection"])
+        allowed_dirs = params.get("lab_dirs_allowed", ["Compra", "Venta", "No definida"])
+        if dir_col is not None and allowed_dirs:
+            if include_missing:
+                d = d[d[dir_col].isin(allowed_dirs) | d[dir_col].isna()]
+            else:
+                d = d[d[dir_col].isin(allowed_dirs)]
+
+        # Horas (entrada) — usa entry_hour si existe; si no, intenta derivar de entry_ts
+        hour_col = _infer_col(d, ["entry_hour", "hour", "entryHour"])
+        if hour_col is None:
+            ts_col = _infer_col(d, ["entry_ts", "entryTime", "entry_time", "ts_entry"])
+            if ts_col is not None:
+                d["_tmp_entry_hour"] = pd.to_datetime(d[ts_col], errors="coerce").dt.hour
+                hour_col = "_tmp_entry_hour"
+        if hour_col is not None:
+            # labels -> horas int
+            sel_labels = params.get("lab_hours_allowed", None)
+            if sel_labels:
+                # construir mapa label->hour para horas presentes
+                hours_present = sorted([int(h) for h in pd.Series(d[hour_col]).dropna().unique().tolist() if str(h).isdigit()])
+                label_map = { _hour_block_label(int(h)) : int(h) for h in hours_present }
+                sel_hours = [label_map.get(x) for x in sel_labels if x in label_map]
+                sel_hours = [h for h in sel_hours if h is not None]
+                if sel_hours:
+                    if include_missing:
+                        d = d[d[hour_col].isin(sel_hours) | d[hour_col].isna()]
+                    else:
+                        d = d[d[hour_col].isin(sel_hours)]
+
+        # Rango OR
+        or_col = _infer_col(d, ["orSize", "or_size", "or", "orPoints"])
+        or_rng = params.get("lab_or_rng", None)
+        if or_col is not None and or_rng and len(or_rng)==2:
+            lo, hi = or_rng
+            x = pd.to_numeric(d[or_col], errors="coerce")
+            if include_missing:
+                d = d[(x.between(lo, hi, inclusive="both")) | x.isna()]
+            else:
+                d = d[x.between(lo, hi, inclusive="both")]
+
+        # Rango ATR
+        atr_col = _infer_col(d, ["atr", "ATR", "atrPoints"])
+        atr_rng = params.get("lab_atr_rng", None)
+        if atr_col is not None and atr_rng and len(atr_rng)==2:
+            lo, hi = atr_rng
+            x = pd.to_numeric(d[atr_col], errors="coerce")
+            if include_missing:
+                d = d[(x.between(lo, hi, inclusive="both")) | x.isna()]
+            else:
+                d = d[x.between(lo, hi, inclusive="both")]
+
+        # Evitar 'sin apoyo'
+        if bool(params.get("lab_avoid_no_support", False)) and "support_flag" in d.columns:
+            if include_missing:
+                d = d[(d["support_flag"] != "Sin datos") | d["support_flag"].isna()]
+            else:
+                d = d[d["support_flag"] != "Sin datos"]
+
+        # limpieza tmp
+        if "_tmp_entry_hour" in d.columns:
+            d.drop(columns=["_tmp_entry_hour"], inplace=True)
+
+        return d
+
+    def _pick_best_bin(df_: pd.DataFrame, col: str, q=4, min_n=25):
+        if col not in df_.columns:
+            return None
+        x = pd.to_numeric(df_[col], errors="coerce")
+        y = pd.to_numeric(df_.get("tradeRealized"), errors="coerce")
+        ok = x.notna() & y.notna()
+        if ok.sum() < max(min_n, q*min_n):
+            return None
+        try:
+            bins = pd.qcut(x[ok], q=q, duplicates="drop")
+        except Exception:
+            return None
+        tmp = pd.DataFrame({"bin": bins, "pnl": y[ok]})
+        grp = tmp.groupby("bin")["pnl"]
+        # Profit Factor aproximado por bin
+        def _pf(s):
+            w = s[s>0].sum()
+            l = -s[s<0].sum()
+            return float(w / l) if l > 0 else (float("inf") if w > 0 else np.nan)
+        stats = grp.agg(n="count", mean="mean")
+        stats["pf"] = grp.apply(_pf)
+        stats = stats[stats["n"] >= min_n].sort_values(["pf","mean"], ascending=False)
+        if stats.empty:
+            return None
+        best_bin = stats.index[0]
+        # devuelve (lo, hi, pf, n)
+        lo = float(best_bin.left)
+        hi = float(best_bin.right)
+        return (lo, hi, float(stats.loc[best_bin, "pf"]), int(stats.loc[best_bin, "n"]))
+
+    def _best_hour(df_: pd.DataFrame, min_n=5):
+        hour_col = _infer_col(df_, ["entry_hour", "hour", "entryHour"])
+        if hour_col is None:
+            return None
+        y = pd.to_numeric(df_.get("tradeRealized"), errors="coerce")
+        ok = y.notna() & pd.to_numeric(df_[hour_col], errors="coerce").notna()
+        if ok.sum() < min_n*2:
+            return None
+        tmp = df_.loc[ok, [hour_col]].copy()
+        tmp["pnl"] = y[ok].values
+        g = tmp.groupby(hour_col)["pnl"].agg(["count","mean"])
+        g = g[g["count"]>=min_n].sort_values("mean", ascending=False)
+        if g.empty:
+            return None
+        h = int(g.index[0])
+        return _hour_block_label(h)
+
+    def _turbo_eval_preset(df_real: pd.DataFrame, params: dict) -> dict:
+        # Filtrar (solo simulación)
+        filt = _lab_filter_df_params(df_real, params)
+        # Simular reglas diarias
+        max_loss = float(params.get("lab_max_loss", 0.0) or 0.0)
+        max_profit = float(params.get("lab_max_profit", 0.0) or 0.0)
+        max_trades = int(params.get("lab_max_trades", 0) or 0)
+        max_consec_losses = int(params.get("lab_max_consec_losses", 0) or 0)
+        stop_big_loss = bool(params.get("lab_stop_big_loss", False))
+        stop_big_win  = bool(params.get("lab_stop_big_win", False))
+        sim_kept, _stops = _simulate_daily_rules(filt, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
+
+        # Métricas
+        pnl_real = float(pd.to_numeric(df_real.get("tradeRealized"), errors="coerce").fillna(0.0).sum()) if df_real is not None else 0.0
+        pnl_sim  = float(pd.to_numeric(sim_kept.get("tradeRealized"), errors="coerce").fillna(0.0).sum()) if sim_kept is not None and not sim_kept.empty else 0.0
+        dd_real  = _dd_mag_from_pnl(pd.to_numeric(df_real.get("tradeRealized"), errors="coerce").fillna(0.0)) if df_real is not None else 0.0
+        dd_sim   = _dd_mag_from_pnl(pd.to_numeric(sim_kept.get("tradeRealized"), errors="coerce").fillna(0.0)) if sim_kept is not None and not sim_kept.empty else 0.0
+
+        # PF
+        pf_sim = profit_factor(sim_kept["tradeRealized"]) if (sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns) else np.nan
+
+        delta_pnl = pnl_sim - pnl_real
+        mejora_dd = dd_real - dd_sim  # positivo = reduce drawdown
+        score_bal = delta_pnl + mejora_dd
+
+        return {
+            "pnl_sim": pnl_sim,
+            "dd_sim": dd_sim,
+            "pf_sim": float(pf_sim) if (pf_sim is not None and not (isinstance(pf_sim,float) and np.isnan(pf_sim))) else np.nan,
+            "trades_sim": int(len(sim_kept)) if sim_kept is not None else 0,
+            "omitidos_filt": int(len(df_real) - len(filt)) if df_real is not None else 0,
+            "delta_pnl": delta_pnl,
+            "mejora_dd": mejora_dd,
+            "score_bal": score_bal,
+        }
+
+    def _preset_summary(params: dict) -> str:
+        parts=[]
+        if params.get("lab_max_trades", 0):
+            parts.append(f"max trades={params['lab_max_trades']}")
+        if params.get("lab_max_loss", 0):
+            parts.append(f"max pérdida/día={params['lab_max_loss']}")
+        if params.get("lab_max_consec_losses", 0):
+            parts.append(f"max pérdidas seguidas={params['lab_max_consec_losses']}")
+        if params.get("lab_hours_allowed"):
+            parts.append("horas=seleccionadas")
+        if params.get("lab_or_rng"):
+            parts.append("OR=rango")
+        if params.get("lab_atr_rng"):
+            parts.append("ATR=rango")
+        if params.get("lab_dirs_allowed") and len(params["lab_dirs_allowed"])<3:
+            parts.append("dir=filtrada")
+        return " | ".join(parts) if parts else "sin cambios"
+
+    # --- Construir presets ---
+    df_real = t.copy()
+
+    # límites base para sliders (si existen)
+    or_col  = _infer_col(df_real, ["orSize","or_size","or","orPoints"])
+    atr_col = _infer_col(df_real, ["atr","ATR","atrPoints"])
+    or_min, or_max = (float(pd.to_numeric(df_real[or_col], errors="coerce").min()), float(pd.to_numeric(df_real[or_col], errors="coerce").max())) if or_col else (None,None)
+    atr_min, atr_max = (float(pd.to_numeric(df_real[atr_col], errors="coerce").min()), float(pd.to_numeric(df_real[atr_col], errors="coerce").max())) if atr_col else (None,None)
+
+    # horas presentes
+    hour_col = _infer_col(df_real, ["entry_hour","hour","entryHour"])
+    hours_present = sorted([int(h) for h in pd.Series(df_real[hour_col]).dropna().unique().tolist()]) if hour_col else []
+    all_hour_labels = [_hour_block_label(h) for h in hours_present] if hours_present else []
+
+    base_preset = {
+        "lab_max_loss": 0.0,
+        "lab_max_profit": 0.0,
+        "lab_max_trades": 0,
+        "lab_max_consec_losses": 0,
+        "lab_stop_big_loss": False,
+        "lab_stop_big_win": False,
+        "lab_include_missing": True,
+        "lab_dirs_allowed": ["Compra","Venta","No definida"],
+        "lab_hours_allowed": all_hour_labels,
+    }
+    if or_min is not None:
+        base_preset["lab_or_rng"] = (or_min, or_max)
+    if atr_min is not None:
+        base_preset["lab_atr_rng"] = (atr_min, atr_max)
+
+    # sugerencias simples desde datos
+    best_h = _best_hour(df_real, min_n=5)
+    best_or = _pick_best_bin(df_real, or_col, q=4, min_n=25) if or_col else None
+    best_atr = _pick_best_bin(df_real, atr_col, q=4, min_n=25) if atr_col else None
+
+    presets=[]
+    presets.append(("Baseline (1:1)", base_preset))
+    presets.append(("DailyGuard: máx trades = 3", {**base_preset, "lab_max_trades": 3}))
+    presets.append(("DailyGuard: 2 pérdidas seguidas = 2", {**base_preset, "lab_max_consec_losses": 2}))
+    presets.append(("DailyGuard: máx pérdida/día = 600", {**base_preset, "lab_max_loss": 600.0}))
+    if best_h:
+        presets.append((f"Filtro: mejor hora ({best_h})", {**base_preset, "lab_hours_allowed": [best_h]}))
+    if best_or:
+        lo,hi,pf,n = best_or
+        presets.append((f"Filtro: OR sugerido ({lo:.2f}–{hi:.2f})", {**base_preset, "lab_or_rng": (lo,hi)}))
+    if best_atr:
+        lo,hi,pf,n = best_atr
+        presets.append((f"Filtro: ATR sugerido ({lo:.2f}–{hi:.2f})", {**base_preset, "lab_atr_rng": (lo,hi)}))
+    # combo
+    combo = dict(base_preset)
+    combo["lab_max_trades"] = 3
+    if best_h:
+        combo["lab_hours_allowed"] = [best_h]
+    if best_or:
+        combo["lab_or_rng"] = (best_or[0], best_or[1])
+    if best_atr:
+        combo["lab_atr_rng"] = (best_atr[0], best_atr[1])
+    presets.append(("Combo (horas + OR + ATR + max trades)", combo))
+
+    # --- Evaluar presets ---
+    rows=[]
+    for name, prm in presets:
+        try:
+            r=_turbo_eval_preset(df_real, prm)
+            r["preset"]=name
+            r["resumen"]=_preset_summary(prm)
+            rows.append(r)
+        except Exception:
+            continue
+    if rows:
+        dfp = pd.DataFrame(rows)
+        order_mode = st.selectbox(
+            "Ordenar presets por",
+            ["Puntaje balanceado (ΔPnL + mejora DD) (recomendado)", "ΔPnL (solo)", "Mejora DD (solo)", "PF sim (solo)"],
+            index=0,
+            key="turbo_order_mode"
+        )
+        if order_mode.startswith("ΔPnL"):
+            dfp = dfp.sort_values("delta_pnl", ascending=False)
+        elif order_mode.startswith("Mejora"):
+            dfp = dfp.sort_values("mejora_dd", ascending=False)
+        elif order_mode.startswith("PF"):
+            dfp = dfp.sort_values("pf_sim", ascending=False)
+        else:
+            dfp = dfp.sort_values("score_bal", ascending=False)
+
+        show = dfp[["preset","resumen","delta_pnl","mejora_dd","trades_sim","pf_sim"]].copy()
+        show.rename(columns={"delta_pnl":"ΔPnL vs real ($)", "mejora_dd":"Mejora DD ($)", "trades_sim":"Trades sim", "pf_sim":"PF sim"}, inplace=True)
+        st.dataframe(show, use_container_width=True, hide_index=True)
+
+        sel = st.selectbox("Aplicar preset", show["preset"].tolist(), key="turbo_sel_preset")
+        if st.button("✅ Aplicar preset seleccionado", key="turbo_apply_btn"):
+            preset_dict = dict(presets)[sel]
+            # aplicar a session_state
+            for k,v in preset_dict.items():
+                st.session_state[k]=v
+            st.rerun()
+    else:
+        st.info("No se pudieron calcular presets (muestra insuficiente o faltan columnas).")
 with lab_right:
     st.markdown("**Filtros (opcional)**")
     base_for_lab = t.copy()  # <-- mismo universo que Resumen rápido
@@ -2461,6 +2759,10 @@ else:
     pf_sim  = profit_factor(sim_df)  if len(sim_df)  else np.nan
 
     st.markdown("### 📊 Resultados del Lab (real vs simulado)")
+    # Defaults defensivos (evita NameError si no se calculan aún)
+    dd_base_f = np.nan
+    dd_sim_mag = np.nan
+
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Trades reales", f"{n_real}")
     c2.metric("Trades simulados", f"{n_sim}", delta=f"{n_sim - n_real}")
@@ -2815,8 +3117,12 @@ else:
                 "pnl_total_dia_base", "pnl_hasta_stop", "pnl_omitido_por_corte", "delta_pnl_vs_base",
                 "dd_dia_base", "dd_dia_sim", "mejora_dd_dia",
             ]
+            cols_present = [c for c in show_cols if c in enriched.columns]
+            cols_missing = [c for c in show_cols if c not in enriched.columns]
+            if cols_missing:
+                st.caption('Columnas no disponibles en este dataset: ' + ', '.join(cols_missing))
             st.dataframe(
-                enriched[show_cols].sort_values(["fecha"]),
+                enriched[cols_present].sort_values(['fecha']) if cols_present else enriched.sort_values(['fecha']),
                 use_container_width=True,
                 hide_index=True,
             )
