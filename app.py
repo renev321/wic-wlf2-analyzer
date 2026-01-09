@@ -396,6 +396,33 @@ def profit_factor(trades) -> float:
     return wins / loss_abs
 
 
+
+def _dd_mag_from_df(df_: pd.DataFrame) -> float:
+    """Máx caída (drawdown) en magnitud ($) usando la curva de equity por trade.
+    Devuelve np.nan si df está vacío o None.
+    """
+    if df_ is None or getattr(df_, "empty", True):
+        return np.nan
+    z = df_.copy()
+    sort_col = "exit_time" if "exit_time" in z.columns else ("entry_time" if "entry_time" in z.columns else None)
+    if sort_col is not None:
+        # Orden consistente; NaT/NaN al final
+        z = z.sort_values(sort_col, na_position="last")
+    pnl = pd.to_numeric(z.get("tradeRealized", pd.Series([], dtype=float)), errors="coerce").fillna(0.0)
+    if pnl.empty:
+        return np.nan
+    eq = pnl.cumsum()
+    peak = eq.cummax()
+    dd = eq - peak
+    if dd.empty:
+        return np.nan
+    v = dd.min()
+    try:
+        return float(abs(v))
+    except Exception:
+        return np.nan
+
+
 def max_streak(outcomes: pd.Series, target: str):
     best_len, cur = 0, 0
     best_end = None
@@ -1491,7 +1518,7 @@ st.subheader("🧭 Compra vs Venta (solo donde hay ENTRY)")
 col1, col2, col3 = st.columns(3)
 col1.metric("Compras (Long)", int((t["lado"] == "Compra (Long)").sum()))
 col2.metric("Ventas (Short)", int((t["lado"] == "Venta (Short)").sum()))
-col3.metric("Sin datos (faltó ENTRY)", int((t["lado"].str.startswith("Sin datos")).sum()))
+col3.metric("Sin datos (faltó ENTRY)", int((t["lado"].str.startswith("No definida")).sum()))
 
 known = t[t["lado"].isin(["Compra (Long)", "Venta (Short)"])].copy()
 if known.empty:
@@ -1860,100 +1887,252 @@ def _finite_minmax(s: pd.Series):
 
 
 
-def _lab_quick_suggestions(t: pd.DataFrame, min_bucket: int = 5) -> dict:
-    """Heurísticas rápidas basadas en tu historial REAL (no simulado).
-    Devuelve un dict con llaves opcionales:
-      - max_intraday_loss, max_intraday_profit (en $) para que NO corte nada
-      - best_hour, worst_hour (int 0..23) por promedio PnL/trade (con muestra >= min_bucket)
-      - rec_max_trades (int) sugerencia de máximo trades/día (si se ve deterioro)
-      - rec_max_consec_losses (int) p75 de racha de pérdidas por día
-      - dir_stats (df) resumen Long/Short
-    Nunca debe lanzar excepción; si falta data, devuelve {}.
+def _lab_quick_suggestions(t):
     """
-    out = {}
-    try:
-        if t is None or t.empty:
-            return out
+    Sugerencias rápidas basadas SOLO en tu historial REAL (sin reglas ni filtros del lab).
 
-        df = t.copy()
+    Devuelve:
+      {"filters": [(titulo, texto), ...], "rules": [(titulo, texto), ...]}
+    """
+    out = {"filters": [], "rules": []}
+    if t is None or getattr(t, "empty", True):
+        return out
 
-        # PnL por trade
-        if "tradeRealized" not in df.columns:
-            return out
-        df["tradeRealized"] = pd.to_numeric(df["tradeRealized"], errors="coerce")
+    base = t.copy()
 
-        # Timestamp por trade (ENTRY preferido; si falta, EXIT como respaldo)
-        ts_entry = pd.to_datetime(df["entry_time"], errors="coerce") if "entry_time" in df.columns else pd.Series(pd.NaT, index=df.index)
-        ts_exit  = pd.to_datetime(df["exit_time"],  errors="coerce") if "exit_time"  in df.columns else pd.Series(pd.NaT, index=df.index)
-        ts = ts_entry.fillna(ts_exit)
+    # --- Columnas robustas para análisis ---
+    # Hora: prioriza entry_time, si falta usa exit_time, y si no existe usa _lab_ts.
+    hour = None
+    if "entry_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["entry_time"]):
+        hour = base["entry_time"].dt.hour
+    elif "_lab_ts" in base.columns and pd.api.types.is_datetime64_any_dtype(base["_lab_ts"]):
+        hour = base["_lab_ts"].dt.hour
+    else:
+        hour = pd.Series(np.nan, index=base.index)
 
-        df["_ts"] = ts
-        df = df[df["_ts"].notna() & df["tradeRealized"].notna()].copy()
-        if df.empty:
-            return out
+    if "exit_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["exit_time"]):
+        hour = hour.where(~hour.isna(), base["exit_time"].dt.hour)
 
-        df["day"] = df["_ts"].dt.date
-        df["hour"] = df["_ts"].dt.hour
+    base["_hour"] = pd.to_numeric(hour, errors="coerce")
 
-        # Baseline de reglas para NO cortar nada (por pnl diario total)
-        per_day = df.groupby("day", as_index=False)["tradeRealized"].sum().rename(columns={"tradeRealized": "pnl_day"})
-        if not per_day.empty:
-            min_day = float(per_day["pnl_day"].min())
-            max_day = float(per_day["pnl_day"].max())
-            out["max_intraday_loss"] = abs(min_day) if min_day < 0 else 0.0
-            out["max_intraday_profit"] = max_day if max_day > 0 else 0.0
+    # Dirección: usa dir numérico si existe; si no, intenta inferir de 'lado'.
+    if "dir" in base.columns:
+        dir_num = pd.to_numeric(base["dir"], errors="coerce")
+    elif "tradeDirection" in base.columns:
+        dir_num = pd.to_numeric(base["tradeDirection"], errors="coerce")
+    else:
+        dir_num = pd.Series(np.nan, index=base.index)
 
-        # Mejor / peor hora por promedio (si hay muestra)
-        by_h = (df.groupby("hour")["tradeRealized"]
-                  .agg(["size", "mean"])
-                  .rename(columns={"size": "n", "mean": "mean_pnl"}))
-        by_h = by_h[by_h["n"] >= int(min_bucket)]
-        if len(by_h) >= 2:
-            out["best_hour"] = int(by_h["mean_pnl"].idxmax())
-            out["worst_hour"] = int(by_h["mean_pnl"].idxmin())
+    base["_dir_num"] = dir_num
+    base["_dir_label"] = np.where(
+        base["_dir_num"] > 0,
+        "Compra",
+        np.where(base["_dir_num"] < 0, "Venta", "No definida")
+    )
 
-        # ¿Se deteriora por trade # dentro del día?
-        df = df.sort_values(["day", "_ts"])
-        df["trade_num_day"] = df.groupby("day").cumcount() + 1
-        by_k = (df.groupby("trade_num_day")["tradeRealized"]
-                  .agg(["size", "mean"])
-                  .rename(columns={"size": "n", "mean": "mean_pnl"}))
-        # buscamos el primer k (>=2) con media negativa y muestra suficiente
-        cand = by_k[(by_k.index >= 2) & (by_k["n"] >= int(min_bucket)) & (by_k["mean_pnl"] < 0)]
-        if not cand.empty:
-            k = int(cand.index.min())
-            out["rec_max_trades"] = max(1, k - 1)
+    if "lado" in base.columns:
+        lado = base["lado"].astype(str)
+        base["_dir_label"] = np.where(
+            lado.str.contains("Compra", na=False),
+            "Compra",
+            np.where(lado.str.contains("Venta", na=False), "Venta", base["_dir_label"])
+        )
 
-        # Racha de pérdidas seguidas por día (p75 de max racha diaria)
-        def _max_streak_losses(s: pd.Series) -> int:
-            x = (s < 0).astype(int).values
-            best = cur = 0
-            for v in x:
-                if v == 1:
-                    cur += 1
-                    best = max(best, cur)
+    # Asegura tradeRealized numérico
+    if "tradeRealized" in base.columns:
+        base["tradeRealized"] = pd.to_numeric(base["tradeRealized"], errors="coerce")
+
+    # --- 1) Horas sugeridas (bloque HH:00–HH:59) ---
+    min_n_hour = 5
+    if "_hour" in base.columns and "tradeRealized" in base.columns:
+        tmp = base.dropna(subset=["_hour", "tradeRealized"]).copy()
+        if not tmp.empty:
+            tmp["_hour"] = tmp["_hour"].astype(int)
+            g = tmp.groupby("_hour")["tradeRealized"].agg(["count", "mean"])
+            g = g[g["count"] >= min_n_hour]
+            if len(g) >= 2:
+                best = g.sort_values("mean", ascending=False).head(2).index.tolist()
+                worst = g.sort_values("mean", ascending=True).head(2).index.tolist()
+
+                def _fmt_hour(h):
+                    return f"{int(h):02d}:00–{int(h):02d}:59"
+
+                best_lbl = ", ".join(_fmt_hour(h) for h in best)
+                worst_lbl = ", ".join(_fmt_hour(h) for h in worst)
+
+                out["filters"].append((
+                    "🕒 Horas",
+                    f"Sugerido: {best_lbl}. Evitar: {worst_lbl}. (n≥{min_n_hour} por hora)"
+                ))
+            else:
+                out["filters"].append((
+                    "🕒 Horas",
+                    f"No concluyente (necesitas n≥{min_n_hour} por bloque horario)."
+                ))
+        else:
+            out["filters"].append(("🕒 Horas", "No concluyente (no hay timestamps suficientes)."))
+
+    # --- 2) Dirección sugerida (Compra/Venta/No definida) ---
+    min_n_dir = 10
+    if "_dir_label" in base.columns and "tradeRealized" in base.columns:
+        d = base.dropna(subset=["tradeRealized"]).copy()
+        if not d.empty:
+            stats = d.groupby("_dir_label")["tradeRealized"].agg(["count", "mean"])
+            buy_n = int(stats.loc["Compra", "count"]) if "Compra" in stats.index else 0
+            sell_n = int(stats.loc["Venta", "count"]) if "Venta" in stats.index else 0
+            buy_mean = float(stats.loc["Compra", "mean"]) if "Compra" in stats.index else np.nan
+            sell_mean = float(stats.loc["Venta", "mean"]) if "Venta" in stats.index else np.nan
+
+            msg = f"Compra prom: {buy_mean:.1f} (n={buy_n}) | Venta prom: {sell_mean:.1f} (n={sell_n})."
+            # Recomendación simple si hay muestra suficiente en ambos lados
+            if buy_n >= min_n_dir and sell_n >= min_n_dir and not (np.isnan(buy_mean) or np.isnan(sell_mean)):
+                if buy_mean > sell_mean * 1.15:
+                    msg += " → Históricamente te va mejor en **Compra**."
+                elif sell_mean > buy_mean * 1.15:
+                    msg += " → Históricamente te va mejor en **Venta**."
                 else:
-                    cur = 0
-            return int(best)
+                    msg += " → Diferencia pequeña (no concluyente)."
+            else:
+                msg += f" (Recomendación requiere n≥{min_n_dir} por lado)."
 
-        streaks = df.groupby("day")["tradeRealized"].apply(_max_streak_losses)
-        if len(streaks) > 0:
-            p75 = float(np.nanpercentile(streaks.values, 75))
-            out["rec_max_consec_losses"] = int(max(1, round(p75)))
+            out["filters"].append(("📈 Dirección", msg))
 
-        # Long / Short stats si existe dir
-        if "dir" in t.columns:
-            d2 = t.copy()
-            d2["tradeRealized"] = pd.to_numeric(d2["tradeRealized"], errors="coerce")
-            d2 = d2[d2["tradeRealized"].notna()]
-            d2["side"] = d2["dir"].apply(lambda v: "Long" if str(v).strip() in ("1", "Long", "LONG") else ("Short" if str(v).strip() in ("-1", "Short", "SHORT") else "Unknown"))
-            ds = d2[d2["side"].isin(["Long", "Short"])].groupby("side")["tradeRealized"].agg(["size", "mean", "median"])
-            if not ds.empty:
-                out["dir_stats"] = ds
-    except Exception:
-        return {}
+    # --- 3) OR/ATR sugeridos (por cuantiles; usa PF) ---
+    def _suggest_range_by_pf(col, label):
+        if col not in base.columns or "tradeRealized" not in base.columns:
+            return None
+        x = pd.to_numeric(base[col], errors="coerce")
+        y = pd.to_numeric(base["tradeRealized"], errors="coerce")
+        tmp = pd.DataFrame({"x": x, "y": y}).dropna()
+        if len(tmp) < 30:
+            return None
+
+        # 3 buckets por cuantiles (evita 'bin' en texto)
+        try:
+            tmp["grp"] = pd.qcut(tmp["x"], q=3, duplicates="drop")
+        except Exception:
+            return None
+
+        rows = []
+        for grp, g in tmp.groupby("grp"):
+            n = len(g)
+            pf = profit_factor(g["y"])
+            if pd.isna(pf):
+                continue
+            rows.append((grp.left, grp.right, float(pf), int(n)))
+
+        if len(rows) < 2:
+            return None
+
+        rows = sorted(rows, key=lambda r: r[2], reverse=True)
+        best = rows[0]
+        worst = rows[-1]
+
+        def _rng(a, b):
+            return f"{a:.2f}–{b:.2f}"
+
+        return f"{label}: { _rng(best[0], best[1]) } (PF {best[2]:.2f}, n={best[3]}) | evitar { _rng(worst[0], worst[1]) } (PF {worst[2]:.2f}, n={worst[3]})."
+
+    or_msg = _suggest_range_by_pf("orSize", "OR sugerido")
+    if or_msg:
+        out["filters"].append(("🧱 OR", or_msg))
+
+    atr_msg = _suggest_range_by_pf("atr", "ATR sugerido")
+    if atr_msg:
+        out["filters"].append(("📏 ATR", atr_msg))
+
+    # --- 4) Reglas sugeridas (Daily Guard): Máx trades/día / Máx pérdidas seguidas ---
+    if "tradeRealized" in base.columns:
+        base_pnl = float(pd.to_numeric(base["tradeRealized"], errors="coerce").fillna(0).sum())
+        dd_base = _dd_mag_from_df(base)
+
+        # candidatos según distribución real (acota a algo razonable)
+        if "entry_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["entry_time"]):
+            dt_for_day = base["entry_time"]
+        elif "exit_time" in base.columns and pd.api.types.is_datetime64_any_dtype(base["exit_time"]):
+            dt_for_day = base["exit_time"]
+        else:
+            dt_for_day = None
+
+        if dt_for_day is not None:
+            day_counts = dt_for_day.dt.date.value_counts()
+            max_obs = int(day_counts.max()) if len(day_counts) else 0
+        else:
+            max_obs = 0
+
+        cand_trades = [v for v in [1, 2, 3, 4, 5] if max_obs == 0 or v <= max(1, max_obs)]
+        cand_losses = [1, 2, 3, 4]
+
+        min_days_rule = 5  # antes estaba muy alto; con n≥5 ya se puede sugerir algo
+
+        def _best_rule(kind, candidates):
+            results = []
+            for val in candidates:
+                if kind == "max_trades":
+                    sim_df, stops_df = _simulate_daily_rules(
+                        base, max_loss=0, max_profit=0, max_trades=val, max_consec_losses=0,
+                        stop_big_loss=False, stop_big_win=False
+                    )
+                    label = f"Máx trades/día = {val}"
+                else:
+                    sim_df, stops_df = _simulate_daily_rules(
+                        base, max_loss=0, max_profit=0, max_trades=0, max_consec_losses=val,
+                        stop_big_loss=False, stop_big_win=False
+                    )
+                    label = f"Máx pérdidas seguidas = {val}"
+
+                sim_pnl = float(pd.to_numeric(sim_df["tradeRealized"], errors="coerce").fillna(0).sum()) if (sim_df is not None and not sim_df.empty and "tradeRealized" in sim_df.columns) else 0.0
+                dd_sim = _dd_mag_from_df(sim_df) if (sim_df is not None and not sim_df.empty) else np.nan
+
+                delta_pnl = sim_pnl - base_pnl
+                mejora_dd = (dd_base - dd_sim) if (not np.isnan(dd_base) and not np.isnan(dd_sim)) else np.nan
+
+                days_cut = 0
+                if stops_df is not None and not stops_df.empty and "fecha" in stops_df.columns:
+                    days_cut = int(pd.to_datetime(stops_df["fecha"], errors="coerce").dt.date.nunique())
+
+                # score ponderado simple (mismo signo: mejor)
+                score = delta_pnl + (0.35 * (mejora_dd if not np.isnan(mejora_dd) else 0.0))
+                results.append((score, days_cut, label, delta_pnl, mejora_dd))
+
+            # elige el mejor score; si hay empate, el que se activó más días
+            results.sort(key=lambda r: (r[0], r[1]), reverse=True)
+            best = results[0] if results else None
+            return best
+
+        # Máx trades/día
+        best_tr = _best_rule("max_trades", cand_trades)
+        if best_tr:
+            score, days_cut, label, delta_pnl, mejora_dd = best_tr
+            if days_cut < min_days_rule:
+                out["rules"].append(("🎛️ Máx trades/día", f"{label}: no concluyente (activada {days_cut} días)."))
+            else:
+                quad = "Mejora PnL y DD" if (delta_pnl > 0 and (not np.isnan(mejora_dd) and mejora_dd > 0)) \
+                       else "Mejora PnL pero empeora DD" if (delta_pnl > 0) \
+                       else "Reduce DD pero cuesta PnL" if (not np.isnan(mejora_dd) and mejora_dd > 0) \
+                       else "Empeora PnL y DD"
+                out["rules"].append((
+                    "🎛️ Máx trades/día",
+                    f"{label} → {quad} (ΔPnL {delta_pnl:+.0f}, ΔDD {mejora_dd:+.0f}, días={days_cut})."
+                ))
+
+        # Máx pérdidas seguidas
+        best_ls = _best_rule("max_losses", cand_losses)
+        if best_ls:
+            score, days_cut, label, delta_pnl, mejora_dd = best_ls
+            if days_cut < min_days_rule:
+                out["rules"].append(("🧯 Máx pérdidas seguidas", f"{label}: no concluyente (activada {days_cut} días)."))
+            else:
+                quad = "Mejora PnL y DD" if (delta_pnl > 0 and (not np.isnan(mejora_dd) and mejora_dd > 0)) \
+                       else "Mejora PnL pero empeora DD" if (delta_pnl > 0) \
+                       else "Reduce DD pero cuesta PnL" if (not np.isnan(mejora_dd) and mejora_dd > 0) \
+                       else "Empeora PnL y DD"
+                out["rules"].append((
+                    "🧯 Máx pérdidas seguidas",
+                    f"{label} → {quad} (ΔPnL {delta_pnl:+.0f}, ΔDD {mejora_dd:+.0f}, días={days_cut})."
+                ))
+
     return out
-
 
 def _apply_filters(df_in: pd.DataFrame):
     """
@@ -2052,53 +2231,66 @@ def _apply_filters(df_in: pd.DataFrame):
         is_unknown = dnum.isna() | (dnum == 0)
 
         dir_opts = ["Venta", "Compra", "No definida"]
-        # Sanear defaults guardados de versiones anteriores
-        _dir_raw = st.session_state.get("lab_dirs_allowed", dir_opts)
-        if not isinstance(_dir_raw, (list, tuple)):
-            _dir_raw = dir_opts
-        _map_dir = {
-            "Largos": "Compra",
-            "Long": "Compra",
-            "Longs": "Compra",
-            "Cortos": "Venta",
-            "Short": "Venta",
-            "Shorts": "Venta",
-            "Sin datos": "No definida",
-            "Sin datos (faltó ENTRY)": "No definida",
-            "Sin datos (faltó Entry)": "No definida",
-            "Sin datos (faltó entry)": "No definida",
-            "No definida": "No definida",
-            "Compra": "Compra",
-            "Venta": "Venta",
-        }
-        _dir_sane = []
-        for v in _dir_raw:
-            v2 = _map_dir.get(str(v), None)
-            if v2 in dir_opts and v2 not in _dir_sane:
-                _dir_sane.append(v2)
-        if not _dir_sane:
-            _dir_sane = dir_opts.copy()
-        st.session_state["lab_dirs_allowed"] = _dir_sane
-        sel_dirs = st.multiselect("Dirección permitida", dir_opts, default=_dir_sane, key="lab_dirs_allowed")        # Horas (entry preferido)
-        _h_raw = st.session_state.get("lab_hours_allowed", hour_labels)
-        if not isinstance(_h_raw, (list, tuple)):
-            _h_raw = hour_labels
-        _h_sane = [h for h in _h_raw if h in hour_labels]
-        if not _h_sane:
-            _h_sane = hour_labels.copy()
-        st.session_state["lab_hours_allowed"] = _h_sane
-        sel_hour_labels = st.multiselect(
-            "Horas permitidas (entrada)",
-            options=hour_labels,
-            default=_h_sane,
-            key="lab_hours_allowed",
-            help="Cada hora representa el bloque completo HH:00–HH:59. Si falta ENTRY, se usa EXIT como respaldo."
-        )
-        sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
+        dir_default = st.session_state.get("lab_dirs_allowed", dir_opts) or []
+        dir_default = [x for x in dir_default if x in dir_opts]
+        if not dir_default:
+            dir_default = dir_opts
+        sel_dirs = st.multiselect("Dirección permitida (entrada)", dir_opts, default=dir_default, key="lab_dirs_allowed")
+
+        # Horas (ENTRY preferido; si falta, EXIT como respaldo)
+        # Nota Streamlit: `default` debe ser subconjunto de `options`.
+        if not hour_labels:
+            st.info("No se detectaron horas válidas (faltan timestamps en ENTRY/EXIT). Se omite el filtro por hora.")
+            sel_hours = None
+        else:
+            default_hours = st.session_state.get("lab_hours_allowed", hour_labels) or []
+            default_hours = [x for x in default_hours if x in hour_labels]
+            if not default_hours:
+                default_hours = hour_labels
+            sel_hour_labels = st.multiselect(
+                "Horas permitidas (entrada)",
+                options=hour_labels,
+                default=default_hours,
+                key="lab_hours_allowed",
+                help="Cada hora representa el bloque completo HH:00–HH:59. Si falta ENTRY, se usa EXIT como respaldo."
+            )
+            sel_hours = [label_to_hour[x] for x in sel_hour_labels if x in label_to_hour]
 
         # Rangos (si existen columnas)
         or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)")
         atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)")
+
+        # EWO (umbral mínimo sobre |EWO|)
+        ewo_col = "ewo" if "ewo" in df.columns else ("ewoMag" if "ewoMag" in df.columns else None)
+        ewo_thr = None
+        if ewo_col:
+            ewo_abs = pd.to_numeric(df[ewo_col], errors="coerce").abs()
+            lo_ewo, hi_ewo = _finite_minmax(ewo_abs) if "_finite_minmax" in globals() else (None, None)
+            if lo_ewo is not None and hi_ewo is not None:
+                ewo_thr = st.slider("|EWO| mínimo", float(lo_ewo), float(hi_ewo), float(st.session_state.get("lab_ewo_thr", float(lo_ewo))), step=max((float(hi_ewo)-float(lo_ewo))/200.0, 0.0001), key="lab_ewo_thr")
+
+        # Absorción / Actividad (si existen)
+        abs_max = None
+        if "absorption" in df.columns:
+            lo_a, hi_a = _finite_minmax(df["absorption"]) if "_finite_minmax" in globals() else (None, None)
+            if lo_a is not None and hi_a is not None:
+                abs_max = st.slider("Absorción máxima (evitar extremos)", float(lo_a), float(hi_a), float(st.session_state.get("lab_abs_max", float(hi_a))), step=max((float(hi_a)-float(lo_a))/200.0, 0.01), key="lab_abs_max")
+
+        act_min = None
+        if "activity_rel" in df.columns:
+            lo_r, hi_r = _finite_minmax(df["activity_rel"]) if "_finite_minmax" in globals() else (None, None)
+            if lo_r is not None and hi_r is not None:
+                act_min = st.slider("Actividad mínima (volumen relativo antes de entrar)", float(lo_r), float(hi_r), float(st.session_state.get("lab_act_min", float(lo_r))), step=max((float(hi_r)-float(lo_r))/200.0, 0.0001), key="lab_act_min")
+
+        # Evitar "sin apoyo" (si existe una columna compatible)
+        no_support_col = None
+        for c in ["noSupport", "sinApoyo", "no_support", "no_support_flag"]:
+            if c in df.columns:
+                no_support_col = c
+                break
+        avoid_no_support = False
+        if no_support_col:
+            avoid_no_support = st.checkbox("Evitar 'sin apoyo' (presión vs avance en contra)", value=bool(st.session_state.get("lab_avoid_no_support", False)), key="lab_avoid_no_support")
 
     # --- aplicar filtros ---
     # Dirección
@@ -2115,7 +2307,7 @@ def _apply_filters(df_in: pd.DataFrame):
         notes.append("⚠️ No seleccionaste ninguna dirección; se ignora el filtro de dirección.")
 
     # Horas
-    if len(sel_hours) > 0 and "_lab_hour" in df.columns:
+    if (sel_hours is not None) and (len(sel_hours) > 0) and "_lab_hour" in df.columns:
         h = pd.to_numeric(df["_lab_hour"], errors="coerce")
         hmask = h.isin(sel_hours)
         if include_missing:
@@ -2126,130 +2318,186 @@ def _apply_filters(df_in: pd.DataFrame):
     df = _apply_range_mask(df, "orSize", or_rng)
     df = _apply_range_mask(df, "atr", atr_rng)
 
+    # EWO min
+    if ewo_col and ewo_thr is not None:
+        s = pd.to_numeric(df[ewo_col], errors="coerce").abs()
+        mask = s >= float(ewo_thr)
+        if include_missing:
+            mask = mask | s.isna()
+        df = df[mask].copy()
+
+    # Absorción max
+    if "absorption" in df.columns and abs_max is not None:
+        s = pd.to_numeric(df["absorption"], errors="coerce")
+        mask = s <= float(abs_max)
+        if include_missing:
+            mask = mask | s.isna()
+        df = df[mask].copy()
+
+    # Actividad min
+    if "activity_rel" in df.columns and act_min is not None:
+        df = _apply_min_mask(df, "activity_rel", act_min)
+
+    # Evitar sin apoyo
+    if no_support_col and avoid_no_support:
+        s = df[no_support_col]
+        # tratamos True/1/"true" como "sin apoyo" (mal) -> excluir
+        bad = s.astype(str).str.lower().isin(["1", "true", "t", "y", "yes"])
+        if include_missing:
+            bad = bad.fillna(False)
+        df = df[~bad].copy()
+
     return df, notes
 
 
-def _simulate_daily_rules(df_in: pd.DataFrame,
+# ============================================================
+# Lab: simulación de reglas diarias (Daily Guard "what-if")
+# ============================================================
+def _simulate_daily_rules(df: pd.DataFrame,
                           max_loss: float = 0.0,
                           max_profit: float = 0.0,
                           max_trades: int = 0,
                           max_consec_losses: int = 0,
                           stop_big_loss: bool = False,
                           stop_big_win: bool = False):
-    """
-    Simula reglas tipo 'Daily Guard' sobre un dataframe ya filtrado.
-
-    - max_loss: corta el día cuando el PnL acumulado <= -max_loss (0 = sin límite)
-    - max_profit: corta el día cuando el PnL acumulado >= max_profit (0 = sin límite)
-    - max_trades: corta el día tras N trades ejecutados (0 = sin límite)
-    - max_consec_losses: corta el día tras N pérdidas seguidas (0 = sin límite)
-    - stop_big_loss: corta el día después de un trade con RR <= -1
-    - stop_big_win: corta el día después de un trade con RR >= 2
+    """Simula reglas diarias sobre un DataFrame de trades.
 
     Devuelve:
-      sim_kept: trades que “quedarían” tras aplicar reglas (incluye el trade que gatilla el corte)
-      stops_df: una fila por día cortado con métricas básicas (para explicar impacto)
+      - kept_df: trades que "habrían ocurrido" con esas reglas
+      - stops_df: 1 fila por día donde se activó un corte (motivo + cuántos trades se omitieron)
+
+    Reglas (si valor == 0 / False => no aplica):
+      - max_loss: corta si PnL acumulado del día <= -max_loss
+      - max_profit: corta si PnL acumulado del día >= max_profit
+      - max_trades: corta tras ejecutar N trades en el día
+      - max_consec_losses: corta tras N pérdidas seguidas
+      - stop_big_loss: corta tras un trade con RR <= -1
+      - stop_big_win: corta tras un trade con RR >= 2
+
+    Nota:
+      - Se ordena por entry_time si existe; si no, por exit_time.
+      - Trades sin timestamp no se pueden asignar a un día: se dejan pasar (no se recortan).
     """
-    if df_in is None or df_in.empty:
-        return (pd.DataFrame() if df_in is None else df_in.copy()), pd.DataFrame()
+    if df is None or df.empty:
+        return (df.copy() if df is not None else pd.DataFrame()), pd.DataFrame()
 
-    df = df_in.copy()
+    work = df.copy()
 
-    # Columna de tiempo para ordenar (ENTRY preferido; fallback EXIT)
-    ts_entry = pd.to_datetime(df["entry_time"], errors="coerce") if "entry_time" in df.columns else pd.Series(pd.NaT, index=df.index)
-    ts_exit  = pd.to_datetime(df["exit_time"],  errors="coerce") if "exit_time"  in df.columns else pd.Series(pd.NaT, index=df.index)
+    time_col = "entry_time" if "entry_time" in work.columns else ("exit_time" if "exit_time" in work.columns else None)
+    if time_col is None:
+        # Sin tiempo no podemos simular "por día"
+        return work, pd.DataFrame()
 
-    df["_sim_ts"] = ts_entry
-    df.loc[df["_sim_ts"].isna(), "_sim_ts"] = ts_exit[df["_sim_ts"].isna()]
+    # Asegurar datetime
+    if not np.issubdtype(work[time_col].dtype, np.datetime64):
+        work[time_col] = pd.to_datetime(work[time_col], errors="coerce")
 
-    # Trades sin timestamp: no se pueden agrupar por día -> se conservan tal cual
-    df_valid = df[df["_sim_ts"].notna()].copy()
-    df_other = df[df["_sim_ts"].isna()].copy()
+    with_time = work[work[time_col].notna()].copy()
+    no_time = work[work[time_col].isna()].copy()
 
-    if df_valid.empty:
-        sim_kept = df_other.copy()
-        sim_kept.drop(columns=["_sim_ts"], errors="ignore", inplace=True)
-        return sim_kept, pd.DataFrame()
+    if with_time.empty:
+        return work, pd.DataFrame()
 
-    df_valid = df_valid.sort_values("_sim_ts").copy()
-    df_valid["day"] = df_valid["_sim_ts"].dt.date
-
-    # Normaliza números
-    if "tradeRealized" in df_valid.columns:
-        df_valid["tradeRealized"] = pd.to_numeric(df_valid["tradeRealized"], errors="coerce").fillna(0.0).astype(float)
-    else:
-        df_valid["tradeRealized"] = 0.0
-
-    rr_series = pd.to_numeric(df_valid["rr"], errors="coerce") if "rr" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
+    with_time = with_time.sort_values(time_col)
+    with_time["day"] = with_time[time_col].dt.date
 
     kept_idx = []
     stop_rows = []
 
-    max_loss = float(max_loss or 0.0)
-    max_profit = float(max_profit or 0.0)
-    max_trades = int(max_trades or 0)
-    max_consec_losses = int(max_consec_losses or 0)
+    # Prioridad cuando varias reglas se disparan en el mismo trade
+    def _pick_motivo(candidates):
+        priority = [
+            "Max pérdida/día",
+            "Max ganancia/día",
+            "Máx trades/día",
+            f"{max_consec_losses} pérdidas seguidas" if max_consec_losses > 0 else None,
+            "Stop‑out fuerte (≤ -1R)",
+            "Cierre tras ganador grande (≥ 2R)",
+        ]
+        priority = [p for p in priority if p is not None]
+        for p in priority:
+            if p in candidates:
+                return p
+        return candidates[0] if candidates else "Regla"
 
-    for d, sub in df_valid.groupby("day", sort=True):
-        sub = sub.sort_values("_sim_ts")
-        total = int(len(sub))
-        cum = 0.0
-        consec = 0
-        taken = 0
-        cut_reason = None
+    for d, sub in with_time.groupby("day", sort=False):
+        pnl_cum = 0.0
+        consec_losses = 0
+        executed = 0
+        stopped = False
 
-        for i, (idx, row) in enumerate(sub.iterrows(), start=1):
-            pnl = float(row.get("tradeRealized", 0.0) or 0.0)
-            rr  = rr_series.loc[idx] if idx in rr_series.index else np.nan
-
-            taken += 1
-            cum += pnl
-            if pnl < 0:
-                consec += 1
-            else:
-                consec = 0
-
+        rows = sub.to_dict("records")
+        for i, r in enumerate(rows):
+            # "Ejecutamos" este trade
+            executed += 1
+            idx = sub.index[i]
             kept_idx.append(idx)
 
-            # Si ya no hay más trades, no tiene sentido marcar corte
-            has_more = taken < total
+            pnl = float(r.get("tradeRealized", 0.0) or 0.0)
+            pnl_cum += pnl
 
-            if has_more and cut_reason is None:
-                if max_trades > 0 and taken >= max_trades:
-                    cut_reason = "Máx trades/día"
-                elif max_loss > 0 and cum <= -abs(max_loss):
-                    cut_reason = "Máx pérdida/día"
-                elif max_profit > 0 and cum >= abs(max_profit):
-                    cut_reason = "Máx ganancia/día"
-                elif max_consec_losses > 0 and consec >= max_consec_losses:
-                    cut_reason = f"{max_consec_losses} pérdidas seguidas"
-                elif bool(stop_big_loss) and np.isfinite(rr) and float(rr) <= -1.0:
-                    cut_reason = "Stop‑out fuerte (≤ -1R)"
-                elif bool(stop_big_win) and np.isfinite(rr) and float(rr) >= 2.0:
-                    cut_reason = "Ganador grande (≥ 2R)"
+            if pnl < 0:
+                consec_losses += 1
+            else:
+                consec_losses = 0
 
-            if cut_reason is not None:
-                # Registramos el corte (el trade que gatilla el corte está incluido)
+            rr = r.get("rr", np.nan)
+            try:
+                rr = float(rr) if rr is not None else np.nan
+            except Exception:
+                rr = np.nan
+
+            # ¿Alguna regla se activó tras este trade?
+            fired = []
+
+            if max_trades and max_trades > 0 and executed >= int(max_trades):
+                fired.append("Máx trades/día")
+
+            if max_loss and max_loss > 0 and pnl_cum <= -float(max_loss):
+                fired.append("Max pérdida/día")
+
+            if max_profit and max_profit > 0 and pnl_cum >= float(max_profit):
+                fired.append("Max ganancia/día")
+
+            if max_consec_losses and max_consec_losses > 0 and consec_losses >= int(max_consec_losses):
+                fired.append(f"{int(max_consec_losses)} pérdidas seguidas")
+
+            if stop_big_loss and not np.isnan(rr) and rr <= -1.0:
+                fired.append("Stop‑out fuerte (≤ -1R)")
+
+            if stop_big_win and not np.isnan(rr) and rr >= 2.0:
+                fired.append("Cierre tras ganador grande (≥ 2R)")
+
+            if fired and not stopped:
+                motivo = _pick_motivo(fired)
+                trades_omitidos = max(0, len(sub) - executed)
                 stop_rows.append({
-                    "fecha": d,
-                    "day": d,
-                    "motivo": cut_reason,
-                    "trades_totales_dia": total,
-                    "trades_ejecutados": taken,
-                    "trades_filtrados_por_stop": int(total - taken),
-                    "pnl_hasta_stop": float(cum),
+                    "fecha": d,      # compat
+                    "day": d,        # compat
+                    "motivo": motivo,
+                    "trades_ejecutados": executed,
+                    "trades_filtrados_por_stop": trades_omitidos,
                 })
-                break  # cortar el resto del día
+                stopped = True
+                break
 
-    sim_kept_valid = df_valid.loc[kept_idx].copy() if kept_idx else df_valid.iloc[0:0].copy()
-    sim_kept = pd.concat([sim_kept_valid, df_other], axis=0, ignore_index=False)
+        # si stopped, no añadimos el resto de idx
+        # si no stopped, el loop ya añadió todos
 
-    # Limpieza auxiliares
-    sim_kept.drop(columns=["_sim_ts"], errors="ignore", inplace=True)
+    kept_df = work.loc[kept_idx].copy()
+    # Añadimos los trades sin timestamp (no se pueden cortar por día)
+    if not no_time.empty:
+        kept_df = pd.concat([kept_df, no_time], ignore_index=False)
+
+    # Orden final estable por el mismo time_col (si existe)
+    if time_col in kept_df.columns:
+        try:
+            kept_df = kept_df.sort_values(time_col)
+        except Exception:
+            pass
 
     stops_df = pd.DataFrame(stop_rows)
-    return sim_kept, stops_df
-
+    return kept_df, stops_df
 
 def _reset_lab_state(base_df: pd.DataFrame):
     """Resetea el Lab para que arranque 1:1 con el Resumen rápido (REAL vs SIMULADO sin cortes)."""
@@ -2320,13 +2568,17 @@ def _reset_lab_state(base_df: pd.DataFrame):
 
     hour_labels = [_hour_label(h) for h in avail_hours]
     st.session_state["lab_hours_allowed"] = hour_labels[:]
-    st.session_state["lab_dirs_allowed"] = ["Venta", "Compra", "No definida"]
+    st.session_state["lab_dirs_allowed"] = ["Compra", "Venta", "No definida"]
     st.session_state["lab_include_missing"] = True
 
 
     # Rangos numéricos -> por defecto NO filtra (rango completo / umbral mínimo)
     st.session_state["lab_or_rng"] = _minmax("orSize")
     st.session_state["lab_atr_rng"] = _minmax("atr")
+    st.session_state["lab_ewo_thr"] = _min_abs("ewo", default=0.0)
+    st.session_state["lab_abs_max"] = _max_val("pre_absorcion", default=0.0)
+    st.session_state["lab_act_min"] = _min_val("pre_actividad_rel", default=0.0)
+    st.session_state["lab_avoid_sin_apoyo"] = False
 
 
 
@@ -2366,607 +2618,37 @@ with lab_left:
     st.markdown("---")
     st.markdown("**🧭 Sugerencias rápidas (según tu historial real)**")
     sugg = _lab_quick_suggestions(t)
-    if not sugg:
-        st.info("No hay suficientes datos para sugerir reglas (o faltan timestamps/PnL).")
+
+    st.markdown("#### 🧰 Filtros sugeridos (entrada) (Horas / Dirección / OR / ATR)")
+    if sugg.get("filters"):
+        for title, msg in sugg["filters"]:
+            st.markdown(f"- {title}: {msg}")
     else:
-        # Valores "sin recortar" (sirven como baseline 1:1 aunque actives la regla)
-        if ("max_intraday_loss" in sugg) or ("max_intraday_profit" in sugg):
-            loss0 = sugg.get("max_intraday_loss", 0.0)
-            prof0 = sugg.get("max_intraday_profit", 0.0)
-            st.caption(f"Baseline 1:1: para que las reglas NO corten nada, usa Max pérdida/día ≈ **{loss0:,.0f}** y Max ganancia/día ≈ **{prof0:,.0f}** (o deja 0 = sin límite).")
+        st.caption("No concluyente: no hubo suficiente muestra para sugerir filtros.")
 
-        best_h = sugg.get("best_hour", None)
-        worst_h = sugg.get("worst_hour", None)
-        if best_h is not None and worst_h is not None:
-            st.write(f"🕒 Mejor hora promedio: **{_hour_label(best_h)}** | Peor: **{_hour_label(worst_h)}** (con muestra ≥ {5}).")
-
-        rec_mt = sugg.get("rec_max_trades", None)
-        if rec_mt is not None and rec_mt >= 1:
-            st.warning(f"📉 A partir del trade #{rec_mt+1} el promedio suele volverse negativo. Prueba **Máx trades/día = {rec_mt}**.", icon="⚠️")
-        else:
-            st.write("📌 No se ve un deterioro claro por # de trade (con la muestra actual).")
-
-        rec_streak = sugg.get("rec_max_consec_losses", None)
-        if rec_streak is not None:
-            rec_streak = max(1, int(rec_streak))
-            st.write(f"🔁 Racha típica (p75) de pérdidas seguidas por día: **{rec_streak}** → prueba Máx pérdidas seguidas = {rec_streak}.")
-
-        if "dir_stats" in sugg and not sugg["dir_stats"].empty:
-            ds = sugg["dir_stats"]
-            try:
-                long_mean = float(ds.loc["Long","mean"]) if "Long" in ds.index else np.nan
-                short_mean = float(ds.loc["Short","mean"]) if "Short" in ds.index else np.nan
-                st.write(f"📊 Long avg: **{long_mean:,.0f}** | Short avg: **{short_mean:,.0f}** (por trade).")
-                if np.isfinite(long_mean) and np.isfinite(short_mean):
-                    if long_mean > 0 and short_mean < 0:
-                        st.warning("➡️ Considera filtrar **solo Long** en el Lab y ver el impacto.", icon="⚠️")
-                    elif short_mean > 0 and long_mean < 0:
-                        st.warning("⬅️ Considera filtrar **solo Short** en el Lab y ver el impacto.", icon="⚠️")
-            except Exception:
-                pass
-
-        # RR-based suggestions
-        if "after_stopout" in sugg:
-            med, n = sugg["after_stopout"]
-            if n >= 5 and np.isfinite(med) and med < 0:
-                st.warning(f"🧯 Tras un stop-out fuerte (RR≤-1), el resto del día tiende a ser negativo (mediana {med:,.0f}, n={n}). Prueba activar esa regla.", icon="⚠️")
-        if "after_bigwin" in sugg:
-            med, n = sugg["after_bigwin"]
-            if n >= 5 and np.isfinite(med) and med < 0:
-                st.warning(f"🏆 Tras un ganador grande (RR≥2), suele haber devolución (mediana resto {med:,.0f}, n={n}). Prueba activar esa regla.", icon="⚠️")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 🚀 Turbo Presets (A): lista de presets aplicables con 1 click
-# Objetivo: sugerir combinaciones simples (filtros + reglas) y permitir aplicarlas.
-# ─────────────────────────────────────────────────────────────────────────────
-with st.expander("🚀 Turbo Optimus Presets (A) — PnL / DD / Corr (1 click)", expanded=False):
-    st.caption("Turbo prueba muchas combinaciones y te devuelve el mejor preset encontrado para: 🚀 PnL, 🛟 DD o ⚖️ balance (PnL + DD + Corr). "
-               "No es una búsqueda exhaustiva global, pero sí optimiza dentro del set probado. "
-               "Al aplicar, verás el resultado en 'Resultados del Lab'.")
-
-    # --- Helpers (sin widgets) ---
-    def _dd_mag_from_pnl(pnl_series: pd.Series) -> float:
-        try:
-            s = pd.to_numeric(pnl_series, errors="coerce").fillna(0.0)
-            if s.empty:
-                return 0.0
-            eq = s.cumsum()
-            peak = eq.cummax()
-            dd = eq - peak
-            return float((-dd.min()) if len(dd) else 0.0)
-        except Exception:
-            return 0.0
-
-    def _infer_col(df_: pd.DataFrame, candidates):
-        for c in candidates:
-            if c in df_.columns:
-                return c
-        return None
-
-    def _lab_filter_df_params(df_: pd.DataFrame, params: dict) -> pd.DataFrame:
-        d = df_.copy()
-
-        include_missing = bool(params.get("lab_include_missing", True))
-
-        # Dirección
-        dir_col = _infer_col(d, ["dir_label", "dir", "direction", "tradeDirection"])
-        allowed_dirs = params.get("lab_dirs_allowed", ["Compra", "Venta", "No definida"])
-        if dir_col is not None and allowed_dirs:
-            if include_missing:
-                d = d[d[dir_col].isin(allowed_dirs) | d[dir_col].isna()]
-            else:
-                d = d[d[dir_col].isin(allowed_dirs)]
-
-        # Horas (entrada) — usa entry_hour si existe; si no, intenta derivar de entry_ts
-        hour_col = _infer_col(d, ["entry_hour", "hour", "entryHour"])
-        if hour_col is None:
-            ts_col = _infer_col(d, ["entry_ts", "entryTime", "entry_time", "ts_entry"])
-            if ts_col is not None:
-                d["_tmp_entry_hour"] = pd.to_datetime(d[ts_col], errors="coerce").dt.hour
-                hour_col = "_tmp_entry_hour"
-        if hour_col is not None:
-            # labels -> horas int
-            sel_labels = params.get("lab_hours_allowed", None)
-            if sel_labels:
-                # construir mapa label->hour para horas presentes
-                hours_present = sorted([int(h) for h in pd.Series(d[hour_col]).dropna().unique().tolist() if str(h).isdigit()])
-                label_map = { _hour_block_label(int(h)) : int(h) for h in hours_present }
-                sel_hours = [label_map.get(x) for x in sel_labels if x in label_map]
-                sel_hours = [h for h in sel_hours if h is not None]
-                if sel_hours:
-                    if include_missing:
-                        d = d[d[hour_col].isin(sel_hours) | d[hour_col].isna()]
-                    else:
-                        d = d[d[hour_col].isin(sel_hours)]
-
-        # Rango OR
-        or_col = _infer_col(d, ["orSize", "or_size", "or", "orPoints"])
-        or_rng = params.get("lab_or_rng", None)
-        if or_col is not None and or_rng and len(or_rng)==2:
-            lo, hi = or_rng
-            x = pd.to_numeric(d[or_col], errors="coerce")
-            if include_missing:
-                d = d[(x.between(lo, hi, inclusive="both")) | x.isna()]
-            else:
-                d = d[x.between(lo, hi, inclusive="both")]
-
-        # Rango ATR
-        atr_col = _infer_col(d, ["atr", "ATR", "atrPoints"])
-        atr_rng = params.get("lab_atr_rng", None)
-        if atr_col is not None and atr_rng and len(atr_rng)==2:
-            lo, hi = atr_rng
-            x = pd.to_numeric(d[atr_col], errors="coerce")
-            if include_missing:
-                d = d[(x.between(lo, hi, inclusive="both")) | x.isna()]
-            else:
-                d = d[x.between(lo, hi, inclusive="both")]
-
-        # Evitar 'sin apoyo'
-        if bool(params.get("lab_avoid_no_support", False)) and "support_flag" in d.columns:
-            if include_missing:
-                d = d[(d["support_flag"] != "Sin datos") | d["support_flag"].isna()]
-            else:
-                d = d[d["support_flag"] != "Sin datos"]
-
-        # limpieza tmp
-        if "_tmp_entry_hour" in d.columns:
-            d.drop(columns=["_tmp_entry_hour"], inplace=True)
-
-        return d
-
-    def _pick_best_bin(df_: pd.DataFrame, col: str, q=4, min_n=25):
-        if col not in df_.columns:
-            return None
-        x = pd.to_numeric(df_[col], errors="coerce")
-        y = pd.to_numeric(df_.get("tradeRealized"), errors="coerce")
-        ok = x.notna() & y.notna()
-        if ok.sum() < max(min_n, q*min_n):
-            return None
-        try:
-            bins = pd.qcut(x[ok], q=q, duplicates="drop")
-        except Exception:
-            return None
-        tmp = pd.DataFrame({"bin": bins, "pnl": y[ok]})
-        grp = tmp.groupby("bin")["pnl"]
-        # Profit Factor aproximado por bin
-        def _pf(s):
-            w = s[s>0].sum()
-            l = -s[s<0].sum()
-            return float(w / l) if l > 0 else (float("inf") if w > 0 else np.nan)
-        stats = grp.agg(n="count", mean="mean")
-        stats["pf"] = grp.apply(_pf)
-        stats = stats[stats["n"] >= min_n].sort_values(["pf","mean"], ascending=False)
-        if stats.empty:
-            return None
-        best_bin = stats.index[0]
-        # devuelve (lo, hi, pf, n)
-        lo = float(best_bin.left)
-        hi = float(best_bin.right)
-        return (lo, hi, float(stats.loc[best_bin, "pf"]), int(stats.loc[best_bin, "n"]))
-
-    def _best_hour(df_: pd.DataFrame, min_n=5):
-        hour_col = _infer_col(df_, ["entry_hour", "hour", "entryHour"])
-        if hour_col is None:
-            return None
-        y = pd.to_numeric(df_.get("tradeRealized"), errors="coerce")
-        ok = y.notna() & pd.to_numeric(df_[hour_col], errors="coerce").notna()
-        if ok.sum() < min_n*2:
-            return None
-        tmp = df_.loc[ok, [hour_col]].copy()
-        tmp["pnl"] = y[ok].values
-        g = tmp.groupby(hour_col)["pnl"].agg(["count","mean"])
-        g = g[g["count"]>=min_n].sort_values("mean", ascending=False)
-        if g.empty:
-            return None
-        h = int(g.index[0])
-        return _hour_block_label(h)
-
-    def _turbo_eval_preset(df_real: pd.DataFrame, params: dict) -> dict:
-        # Filtrar (solo simulación)
-        filt = _lab_filter_df_params(df_real, params)
-        # Simular reglas diarias
-        max_loss = float(params.get("lab_max_loss", 0.0) or 0.0)
-        max_profit = float(params.get("lab_max_profit", 0.0) or 0.0)
-        max_trades = int(params.get("lab_max_trades", 0) or 0)
-        max_consec_losses = int(params.get("lab_max_consec_losses", 0) or 0)
-        stop_big_loss = bool(params.get("lab_stop_big_loss", False))
-        stop_big_win  = bool(params.get("lab_stop_big_win", False))
-        sim_kept, _stops = _simulate_daily_rules(filt, max_loss, max_profit, max_trades, max_consec_losses, stop_big_loss, stop_big_win)
-
-        # Métricas
-        pnl_real = float(pd.to_numeric(df_real.get("tradeRealized"), errors="coerce").fillna(0.0).sum()) if df_real is not None else 0.0
-        pnl_sim  = float(pd.to_numeric(sim_kept.get("tradeRealized"), errors="coerce").fillna(0.0).sum()) if sim_kept is not None and not sim_kept.empty else 0.0
-        dd_real  = _dd_mag_from_pnl(pd.to_numeric(df_real.get("tradeRealized"), errors="coerce").fillna(0.0)) if df_real is not None else 0.0
-        dd_sim   = _dd_mag_from_pnl(pd.to_numeric(sim_kept.get("tradeRealized"), errors="coerce").fillna(0.0)) if sim_kept is not None and not sim_kept.empty else 0.0
-
-        # Correlation proxy: per-trade PnL vs drawdown depth after each trade (closer to 0 = more stable)
-        corr_pnl_dd = float("nan")
-        if sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns:
-            _pnls = pd.to_numeric(sim_kept["tradeRealized"], errors="coerce").fillna(0.0).to_numpy()
-            _eq = np.cumsum(_pnls)
-            _peak = np.maximum.accumulate(_eq)
-            _dd_depth = _eq - _peak
-            corr_pnl_dd = _safe_corr(_pnls, _dd_depth)
-
-
-        # PF
-        pf_sim = profit_factor(sim_kept["tradeRealized"]) if (sim_kept is not None and not sim_kept.empty and "tradeRealized" in sim_kept.columns) else np.nan
-
-        delta_pnl = pnl_sim - pnl_real
-        mejora_dd = dd_real - dd_sim  # positivo = reduce drawdown
-        score_bal = delta_pnl + mejora_dd
-
-        # Tuned score = balanced score with a penalty for high |corr_pnl_dd|
-        score_tuned = score_bal - (5000.0 * abs(corr_pnl_dd) if np.isfinite(corr_pnl_dd) else 0.0)
-
-
-        return {
-            "pnl_sim": pnl_sim,
-            "dd_sim": dd_sim,
-            "pf_sim": float(pf_sim) if (pf_sim is not None and not (isinstance(pf_sim,float) and np.isnan(pf_sim))) else np.nan,
-            "trades_sim": int(len(sim_kept)) if sim_kept is not None else 0,
-            "omitidos_filt": int(len(df_real) - len(filt)) if df_real is not None else 0,
-            "delta_pnl": delta_pnl,
-            "mejora_dd": mejora_dd,
-            "score_bal": score_bal,
-            "corr_pnl_dd": corr_pnl_dd,
-            "score_tuned": score_tuned,
-        }
-
-    def _preset_summary(params: dict) -> str:
-        parts=[]
-        if params.get("lab_max_trades", 0):
-            parts.append(f"max trades={params['lab_max_trades']}")
-        if params.get("lab_max_loss", 0):
-            parts.append(f"max pérdida/día={params['lab_max_loss']}")
-        if params.get("lab_max_consec_losses", 0):
-            parts.append(f"max pérdidas seguidas={params['lab_max_consec_losses']}")
-        if params.get("lab_hours_allowed"):
-            parts.append("horas=seleccionadas")
-        if params.get("lab_or_rng"):
-            parts.append("OR=rango")
-        if params.get("lab_atr_rng"):
-            parts.append("ATR=rango")
-        if params.get("lab_dirs_allowed") and len(params["lab_dirs_allowed"])<3:
-            parts.append("dir=filtrada")
-        return " | ".join(parts) if parts else "sin cambios"
-
-    # --- Construir presets ---
-        # base_preset: baseline LAB settings (sin filtros / sin límites)
-    # - Usamos el estado actual si ya existe; si no, tomamos defaults amplios basados en el dataset.
-    def _turbo_build_base_preset(_df):
-        dirs_default = ["Compra", "Venta", "No definida"]
-        # hours labels (00:00..23:00) – si no hay horas en estado, usa todas
-        hours_default = [f"{h:02d}:00" for h in range(24)]
-        # OR / ATR ranges from data (full range)
-        or_col = _infer_col(_df, ["or_points", "or_pts", "or_range_pts", "or_range_points", "or_range", "or"])
-        atr_col = _infer_col(_df, ["atr_points", "atr_pts", "atr", "atr_range", "atr_range_pts", "atr_range_points"])
-        or_lo, or_hi = (0.0, 0.0)
-        atr_lo, atr_hi = (0.0, 0.0)
-        try:
-            if or_col and or_col in _df.columns:
-                or_lo, or_hi = _finite_minmax(_df[or_col])
-            if atr_col and atr_col in _df.columns:
-                atr_lo, atr_hi = _finite_minmax(_df[atr_col])
-        except Exception:
-            pass
-        # Prefer existing session_state (so baseline matches what the user currently sees)
-        ss = st.session_state
-        return {
-            "lab_max_loss": float(ss.get("lab_max_loss", 0.0) or 0.0),
-            "lab_max_profit": float(ss.get("lab_max_profit", 0.0) or 0.0),
-            "lab_max_trades": int(ss.get("lab_max_trades", 0) or 0),
-            "lab_max_consec_losses": int(ss.get("lab_max_consec_losses", 0) or 0),
-            "lab_stop_big_loss": bool(ss.get("lab_stop_big_loss", False)),
-            "lab_stop_big_win": bool(ss.get("lab_stop_big_win", False)),
-            "lab_include_missing": bool(ss.get("lab_include_missing", True)),
-            "lab_dirs_allowed": list(ss.get("lab_dirs_allowed", dirs_default)),
-            "lab_hours_allowed": list(ss.get("lab_hours_allowed", hours_default)),
-            "lab_or_rng": list(ss.get("lab_or_rng", [or_lo, or_hi])),
-            "lab_atr_rng": list(ss.get("lab_atr_rng", [atr_lo, atr_hi])),
-            "lab_avoid_no_support": bool(ss.get("lab_avoid_no_support", False)),
-        }
-    
-    df_real = globals().get("t", globals().get("trades", pd.DataFrame()))
-    base_preset = _turbo_build_base_preset(df_real)
-    
-    presets = [("Baseline (1:1)", base_preset)]
-
-    # Guardrails simples (rápidos)
-    presets.append(("🧯 Stop-Guard (max loss + consec loss)", {**base_preset, "lab_max_loss": 600, "lab_max_consec_losses": 2, "lab_stop_big_loss": True}))
-    presets.append(("🧯 Stop-Guard (max loss más estricto)", {**base_preset, "lab_max_loss": 400, "lab_max_consec_losses": 2, "lab_stop_big_loss": True}))
-    presets.append(("🎯 Take-Profit Guard (max profit)", {**base_preset, "lab_max_profit": 600, "lab_stop_big_win": True}))
-
-    # Sugerencias simples por 1 dimensión (hora / OR / ATR)
-    if hours_present:
-        best_h = hours_present[0]
-        presets.append((f"⏱️ Mejor hora ({_hour_block_label(best_h)})", {**base_preset, "lab_hours_allowed": [_hour_block_label(best_h)]}))
-
-    if or_present is not None and len(or_present) > 5:
-        bins_or = _best_bin_for_metric(or_present, df_real, "lab_or_rng")
-        if bins_or is not None:
-            presets.append((f"📦 Mejor bin OR ({bins_or[0]:.2f}-{bins_or[1]:.2f})", {**base_preset, "lab_or_rng": bins_or}))
-
-    if atr_present is not None and len(atr_present) > 5:
-        bins_atr = _best_bin_for_metric(atr_present, df_real, "lab_atr_rng")
-        if bins_atr is not None:
-            presets.append((f"🌡️ Mejor bin ATR ({bins_atr[0]:.2f}-{bins_atr[1]:.2f})", {**base_preset, "lab_atr_rng": bins_atr}))
-
-    st.markdown("#### ⚡ Optimus presets (combinaciones Time + OR + ATR + Risk)\n""Esto **sí** busca combinaciones (in-sample) para **subir PnL**, **bajar DD** y mejorar una métrica de **estabilidad (|corr|)**.\n""No es garantía de futuro — pero te da *presets listos* para probar en tus experimentos.")
-
-    c1, c2, c3, c4 = st.columns([1.2, 1.0, 1.0, 1.2])
-    with c1:
-        turbo_depth = st.selectbox("Intensidad", ["Lite", "Normal", "Max"], index=1, key="turbo_depth")
-    with c2:
-        min_trades_opt = st.number_input("Min trades", min_value=5, max_value=500, value=30, step=5, key="turbo_min_trades")
-    with c3:
-        max_presets_out = st.number_input("Top presets", min_value=5, max_value=30, value=12, step=1, key="turbo_topn")
-    with c4:
-        auto_run = st.checkbox("Auto-calcular Optimus", value=True, key="turbo_auto")
-
-    def _quantile_ranges(x, q=6):
-        x = pd.to_numeric(pd.Series(x), errors="coerce").dropna()
-        if len(x) < 10:
-            return []
-        qs = np.unique(np.quantile(x, np.linspace(0, 1, q + 1)))
-        if len(qs) < 3:
-            return []
-        rngs = []
-        for i in range(len(qs) - 1):
-            lo, hi = float(qs[i]), float(qs[i + 1])
-            if hi > lo:
-                rngs.append((lo, hi))
-        return rngs
-
-    def _pick_top_ranges(ranges, base_params, key_name, top_k, sort_mode):
-        scored = []
-        for lo, hi in ranges:
-            p = dict(base_params)
-            p[key_name] = (lo, hi)
-            r = _turbo_eval_preset(df_real, p)
-            if r is None or r.get("trades_sim", 0) < min_trades_opt:
-                continue
-            dd_mag = _dd_mag_from_pnl(r.get("dd_sim", 0.0))
-            if sort_mode == "pnl":
-                score = r.get("pnl_sim", 0.0)
-            elif sort_mode == "dd":
-                score = -dd_mag
-            else:
-                score = r.get("score_tuned", r.get("score_bal", 0.0))
-            scored.append((score, (lo, hi)))
-        scored.sort(key=lambda z: z[0], reverse=True)
-        return [rng for _, rng in scored[:top_k]]
-
-    def _build_hours_candidates(top_h=6):
-        if not hours_present:
-            return [None]
-        # ranking simple por PnL (sin filtros adicionales)
-        scored = []
-        for h in hours_present:
-            p = dict(base_preset)
-            p["lab_hours_allowed"] = [_hour_block_label(h)]
-            r = _turbo_eval_preset(df_real, p)
-            if r is None or r.get("trades_sim", 0) < min_trades_opt:
-                continue
-            scored.append((r.get("pnl_sim", 0.0), _hour_block_label(h)))
-        scored.sort(key=lambda z: z[0], reverse=True)
-        top_labels = [lab for _, lab in scored[:top_h]]
-        hours_sets = [None] + [[lab] for lab in top_labels]
-        # combos de 2 horas (solo si hay suficiente)
-        if len(top_labels) >= 2:
-            hours_sets += [[top_labels[0], top_labels[1]]]
-        return hours_sets
-
-    def _optimus_search(depth):
-        base_eval = _turbo_eval_preset(df_real, base_preset)
-        if base_eval is None:
-            return []
-        dd_base = _dd_mag_from_pnl(base_eval.get("dd_sim", 0.0))
-
-        if depth == "Lite":
-            top_h, top_or, top_atr = 4, 3, 3
-            max_trades_list = [0, 2, 3]
-            max_consec_list = [0, 2]
-            max_loss_list = [0, 600]
-        elif depth == "Max":
-            top_h, top_or, top_atr = 8, 6, 6
-            max_trades_list = [0, 2, 3, 4, 5]
-            max_consec_list = [0, 2, 3, 4]
-            max_loss_list = [0, 400, 600, 800, 1000]
-        else:
-            top_h, top_or, top_atr = 6, 4, 4
-            max_trades_list = [0, 2, 3, 4]
-            max_consec_list = [0, 2, 3]
-            max_loss_list = [0, 600, 1000]
-
-        hour_sets = _build_hours_candidates(top_h=top_h)
-
-        or_ranges_all = _quantile_ranges(or_present, q=max(4, top_or)) if or_present is not None else []
-        atr_ranges_all = _quantile_ranges(atr_present, q=max(4, top_atr)) if atr_present is not None else []
-
-        # escoger top bins por score tuned (más robusto)
-        or_ranges = _pick_top_ranges(or_ranges_all, base_preset, "lab_or_rng", top_or, sort_mode="tuned") if or_ranges_all else [None]
-        atr_ranges = _pick_top_ranges(atr_ranges_all, base_preset, "lab_atr_rng", top_atr, sort_mode="tuned") if atr_ranges_all else [None]
-
-        candidates = []
-        for hs in hour_sets:
-            for or_rng in or_ranges:
-                for atr_rng in atr_ranges:
-                    for mt in max_trades_list:
-                        for mcl in max_consec_list:
-                            for ml in max_loss_list:
-                                p = dict(base_preset)
-                                if hs is not None:
-                                    p["lab_hours_allowed"] = hs
-                                if or_rng is not None:
-                                    p["lab_or_rng"] = or_rng
-                                if atr_rng is not None:
-                                    p["lab_atr_rng"] = atr_rng
-                                if mt > 0:
-                                    p["lab_max_trades"] = int(mt)
-                                if mcl > 0:
-                                    p["lab_max_consec_losses"] = int(mcl)
-                                if ml > 0:
-                                    p["lab_max_loss"] = float(ml)
-                                    p["lab_stop_big_loss"] = True
-                                candidates.append(p)
-
-        # cap (para no explotar)
-        cap = 250 if depth == "Lite" else (900 if depth == "Normal" else 2000)
-        if len(candidates) > cap:
-            _rng = np.random.default_rng(7)
-            _idxs = _rng.choice(len(candidates), size=cap, replace=False)
-            candidates = [candidates[int(i)] for i in _idxs]
-
-        scored = []
-        for p in candidates:
-            r = _turbo_eval_preset(df_real, p)
-            if r is None:
-                continue
-            n = int(r.get("trades_sim", 0))
-            if n < int(min_trades_opt):
-                continue
-            pnl = float(r.get("pnl_sim", 0.0))
-            dd  = float(r.get("dd_sim", 0.0))
-            dd_mag = _dd_mag_from_pnl(dd)
-            corr = r.get("corr_pnl_dd", float('nan'))
-            score_tuned = float(r.get("score_tuned", r.get("score_bal", 0.0)))
-            scored.append({"p": p, "pnl": pnl, "dd": dd, "dd_mag": dd_mag, "corr": corr, "score_tuned": score_tuned, "n": n})
-
-        if not scored:
-            return []
-
-        # constraints suaves para evitar 'PnL a cualquier costo'
-        dd_cap = dd_base * 1.35 if dd_base > 0 else float('inf')
-
-        rocket_pool = [x for x in scored if x["dd_mag"] <= dd_cap]
-        if not rocket_pool:
-            rocket_pool = scored
-        best_rocket = max(rocket_pool, key=lambda x: x["pnl"])
-
-        sub_pool = [x for x in scored if x["pnl"] >= max(0.0, base_eval.get("pnl_sim", 0.0) * 0.25)]
-        if not sub_pool:
-            sub_pool = scored
-        best_sub = min(sub_pool, key=lambda x: x["dd_mag"])
-
-        best_tuned = max(scored, key=lambda x: x["score_tuned"])
-
-        # Top adicionales (tuned)
-        scored_sorted = sorted(scored, key=lambda x: x["score_tuned"], reverse=True)
-        extras = scored_sorted[:int(max_presets_out)]
-
-        def _label(x, tag):
-            pnl = x["pnl"]; dd = x["dd"]; corr = x["corr"]; n = x["n"]
-            corr_txt = "" if not np.isfinite(corr) else f" |corr|={abs(corr):.2f}"
-            return f"{tag} PnL={pnl:,.0f}  DD={dd:,.0f}  (n={n}){corr_txt}"
-
-        out = []
-        out.append((_label(best_rocket, "🚀 Rocket"), best_rocket["p"]))
-        out.append((_label(best_sub, "🛟 Submarine"), best_sub["p"]))
-        out.append((_label(best_tuned, "🎛️ Tuned"), best_tuned["p"]))
-
-        # extras (evitar duplicados)
-        seen = {id(best_rocket["p"]), id(best_sub["p"]), id(best_tuned["p"])}
-        for x in extras:
-            if len(out) >= int(max_presets_out):
-                break
-            out.append((_label(x, "⚡ Optimus"), x["p"]))
-        return out
-
-    optimus_presets = []
-    if auto_run:
-        optimus_presets = _optimus_search(turbo_depth)
+    st.markdown("#### 🎛️ Reglas sugeridas (Daily Guard) (Máx trades/día / Máx pérdidas seguidas)")
+    if sugg.get("rules"):
+        for title, msg in sugg["rules"]:
+            st.markdown(f"- {title}: {msg}")
     else:
-        if st.button("🔍 Calcular Optimus ahora", key="turbo_run_now"):
-            optimus_presets = _optimus_search(turbo_depth)
+        st.caption("No concluyente: no hubo suficiente muestra para sugerir reglas.")
 
-    if optimus_presets:
-        presets.extend(optimus_presets)
-    else:
-        st.caption("Optimus: no hubo resultados con suficientes trades (sube 'Min trades' o usa 'Lite').")
-    # --- Evaluar presets ---
-    show = []
-    for label, params in presets:
-        r = _turbo_eval_preset(df_real, params)
-        if r is None:
-            continue
-        show.append({
-            "Preset": label,
-            "pnl_sim": r.get("pnl_sim", float('nan')),
-            "dd_sim": r.get("dd_sim", float('nan')),
-            "pf_sim": r.get("pf_sim", float('nan')),
-            "trades_sim": r.get("trades_sim", 0),
-            "omitidos_filt": r.get("omitidos_filt", 0),
-            "delta_pnl": r.get("delta_pnl", float('nan')),
-            "mejora_dd": r.get("mejora_dd", float('nan')),
-            "score_bal": r.get("score_bal", float('nan')),
-            "corr_pnl_dd": r.get("corr_pnl_dd", float('nan')),
-            "score_tuned": r.get("score_tuned", float('nan')),
-            "_params": params,
-        })
+    # Referencia: qué valores NO cortan nada en tu histórico real (sirve como 'reset mental')
+    _dt_for_day = None
+    if "entry_time" in t.columns and pd.api.types.is_datetime64_any_dtype(t["entry_time"]):
+        _dt_for_day = t["entry_time"]
+    elif "exit_time" in t.columns and pd.api.types.is_datetime64_any_dtype(t["exit_time"]):
+        _dt_for_day = t["exit_time"]
 
-    if not show:
-        st.info("No hay presets evaluables (quizás no hay trades suficientes / faltan columnas).")
-    else:
-        show = pd.DataFrame(show)
-        show["dd_mag"] = show["dd_sim"].apply(_dd_mag_from_pnl)
-        show["abs_corr"] = show["corr_pnl_dd"].apply(lambda x: abs(x) if np.isfinite(x) else float('nan'))
-
-        # Highlights (1 por objetivo)
-        best_rocket = show.sort_values("pnl_sim", ascending=False).iloc[0]
-        best_sub = show.sort_values("dd_mag", ascending=True).iloc[0]
-        best_tuned = show.sort_values("score_tuned", ascending=False).iloc[0]
-
-        h1, h2, h3 = st.columns(3)
-        with h1:
-            st.metric("🚀 Rocket (PnL)", f"{best_rocket['pnl_sim']:,.0f}", f"DD {best_rocket['dd_sim']:,.0f}")
-            st.caption(_describe_preset(best_rocket["_params"]))
-        with h2:
-            st.metric("🛟 Submarine (DD)", f"{best_sub['dd_sim']:,.0f}", f"PnL {best_sub['pnl_sim']:,.0f}")
-            st.caption(_describe_preset(best_sub["_params"]))
-        with h3:
-            st.metric("🎛️ Tuned (PnL+DD+Corr)", f"{best_tuned['score_tuned']:,.0f}", f"PnL {best_tuned['pnl_sim']:,.0f} | DD {best_tuned['dd_sim']:,.0f}")
-            st.caption(_describe_preset(best_tuned["_params"]))
-
-        order_mode = st.selectbox(
-            "Ordenar por",
-            ["🎛️ Tuned (PnL + DD + Corr)", "🚀 Mejor PnL", "🛟 Menor DD (magnitud)", "⚖️ Balance (ΔPnL + mejora DD)"],
-            key="turbo_order_mode",
-        )
-
-        if order_mode.startswith("🚀"):
-            show = show.sort_values("pnl_sim", ascending=False)
-        elif order_mode.startswith("🛟"):
-            show = show.sort_values("dd_mag", ascending=True)
-        elif order_mode.startswith("🎛️"):
-            show = show.sort_values("score_tuned", ascending=False)
-        else:
-            show = show.sort_values("score_bal", ascending=False)
-
-        show_disp = show.drop(columns=["_params"])
-        show_disp = show_disp.rename(columns={
-            "pnl_sim": "PnL sim ($)",
-            "dd_sim": "Max DD sim ($)",
-            "pf_sim": "PF sim",
-            "trades_sim": "Trades sim",
-            "omitidos_filt": "Omitidos por filtros",
-            "delta_pnl": "ΔPnL vs real ($)",
-            "mejora_dd": "Mejora DD vs real ($)",
-            "score_bal": "Score balance",
-            "corr_pnl_dd": "Corr(PnL,DD)",
-            "score_tuned": "Score tuned",
-            "dd_mag": "|DD|",
-            "abs_corr": "|corr|",
-        })
-        st.dataframe(show_disp, use_container_width=True, hide_index=True)
-
-        sel = st.selectbox("Aplicar preset", options=show["Preset"].tolist(), key="turbo_sel_preset")
-        if st.button("✅ Aplicar", key="turbo_apply_btn"):
-            chosen = show.loc[show["Preset"] == sel].iloc[0]
-            for k, v in chosen["_params"].items():
-                st.session_state[k] = v
-            st.success(f"Preset aplicado: {sel}")
-            st.rerun()
+    if _dt_for_day is not None and "tradeRealized" in t.columns:
+        _daily = t.copy()
+        _daily["__day"] = _dt_for_day.dt.date
+        _daily["__pnl"] = pd.to_numeric(_daily["tradeRealized"], errors="coerce").fillna(0)
+        _day_pnl = _daily.groupby("__day")["__pnl"].sum()
+        if len(_day_pnl) > 0:
+            _max_loss = float(abs(_day_pnl.min())) if _day_pnl.min() < 0 else 0.0
+            _max_profit = float(_day_pnl.max()) if _day_pnl.max() > 0 else 0.0
+            st.caption(f"Referencia: para no cortar nada, usa Máx pérdida/día = {_max_loss:.0f} y Máx ganancia/día = {_max_profit:.0f}.")
 with lab_right:
     st.markdown("**Filtros (opcional)**")
     base_for_lab = t.copy()  # <-- mismo universo que Resumen rápido
@@ -3013,10 +2695,6 @@ else:
     pf_sim  = profit_factor(sim_df)  if len(sim_df)  else np.nan
 
     st.markdown("### 📊 Resultados del Lab (real vs simulado)")
-    # Defaults defensivos (evita NameError si no se calculan aún)
-    dd_base_f = np.nan
-    dd_sim_mag = np.nan
-
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Trades reales", f"{n_real}")
     c2.metric("Trades simulados", f"{n_sim}", delta=f"{n_sim - n_real}")
@@ -3100,6 +2778,8 @@ else:
         dd_day_sim = []
         delta_dd = []
         stop_ahorra = []
+        trades_totales = []
+        pnl_hasta_stop_list = []
 
         for _, r in enriched.iterrows():
             d = r["fecha"]
@@ -3107,6 +2787,8 @@ else:
             pnls = day_to_pnls.get(d, [])
             base_total = float(np.sum(pnls)) if pnls else 0.0
             kept_total = float(np.sum(pnls[:taken])) if pnls else 0.0
+            trades_totales.append(int(len(pnls)))
+            pnl_hasta_stop_list.append(float(kept_total))
             skipped = base_total - kept_total              # lo que "se pierde" por cortar
             d_pnl = kept_total - base_total                # impacto vs base (positivo = mejora)
 
@@ -3129,6 +2811,8 @@ else:
         enriched["dd_dia_sim"] = dd_day_sim
         enriched["mejora_dd_dia"] = delta_dd
         enriched["evito_perdidas"] = stop_ahorra
+        enriched["trades_totales_dia"] = trades_totales
+        enriched["pnl_hasta_stop"] = pnl_hasta_stop_list
 
         # Resumen por motivo (lo realmente útil)
         impact = (
@@ -3349,6 +3033,21 @@ else:
             st.plotly_chart(figwf, use_container_width=True)
 
             with st.expander("Ver tabla (what‑if por regla)"):
+                st.markdown(
+                    """**Cómo leer esta tabla (simple):**  
+
+**ΔPnL** = cuánto habría cambiado tu PnL total vs lo real (positivo = mejora).  
+
+**Mejora DD** = cuánto se reduce la peor caída (positivo = mejor).  
+
+**Días cortados** = días donde la regla detuvo el trading.  
+
+**Trades sim** = trades que quedarían con esa regla.  
+
+**PF sim** = Profit Factor del simulado.  
+
+**Cuadrante** = resumen del trade‑off (mejora DD pero cuesta PnL, etc.)."""
+                )
                 wf2 = wf.sort_values(["cuadrante","mejora_dd","delta_pnl"], ascending=[True, False, False]).copy()
                 wf2["delta_pnl"] = wf2["delta_pnl"].round(0).astype(int)
                 wf2["mejora_dd"] = wf2["mejora_dd"].round(0).astype(int)
@@ -3364,6 +3063,108 @@ else:
         else:
             st.info("Activa al menos una regla diaria para ver el 'what‑if por regla'.")
 
+
+        # --- Resumen funky + export (CSV) ---
+        st.markdown("##### 🎛️ Resumen rápido de configuración (Lab)")
+        cfg = []
+        cfg.append(f"📉 Máx pérdida/día: {max_loss:.0f}" if max_loss > 0 else "📉 Máx pérdida/día: sin límite")
+        cfg.append(f"📈 Máx ganancia/día: {max_profit:.0f}" if max_profit > 0 else "📈 Máx ganancia/día: sin límite")
+        cfg.append(f"🔢 Máx trades/día: {max_trades}" if max_trades > 0 else "🔢 Máx trades/día: sin límite")
+        cfg.append(f"🧱 Máx pérdidas seguidas: {max_consec_losses}" if max_consec_losses > 0 else "🧱 Máx pérdidas seguidas: sin límite")
+        if stop_big_loss:
+            cfg.append("🛑 Stop por stop‑out fuerte (RR ≤ -1)")
+        if stop_big_win:
+            cfg.append("🏁 Stop por ganador grande (RR ≥ 2)")
+        if filter_notes:
+            cfg.append("🔎 Filtros: " + " | ".join(filter_notes))
+        st.caption(" • ".join(cfg))
+
+        # One‑liners por regla (usa la tabla what‑if)
+        if 'wf2' in locals() and isinstance(wf2, pd.DataFrame) and not wf2.empty:
+            st.markdown("##### ✨ One‑liners (what‑if por regla)")
+            def _val_for_rule(r):
+                r = str(r)
+                if "trades/día" in r:
+                    return f"{max_trades}" if max_trades > 0 else "sin límite"
+                if "pérdida/día" in r:
+                    return f"{max_loss:.0f}" if max_loss > 0 else "sin límite"
+                if "ganancia/día" in r:
+                    return f"{max_profit:.0f}" if max_profit > 0 else "sin límite"
+                if "pérdidas seguidas" in r:
+                    return f"{max_consec_losses}" if max_consec_losses > 0 else "sin límite"
+                if "stop-out fuerte" in r:
+                    return "RR ≤ -1"
+                if "ganador grande" in r:
+                    return "RR ≥ 2"
+                return ""
+
+            def _emoji_for_quad(q):
+                q = str(q)
+                if "Mejora PnL y DD" in q:
+                    return "🏆", "Winner"
+                if "Reduce DD" in q and "cuesta PnL" in q:
+                    return "🟡", "Reduce DD pero cuesta PnL"
+                if "Mejora PnL" in q and "empeora DD" in q:
+                    return "🟠", "Mejora PnL pero sube DD"
+                if "Empeora" in q:
+                    return "🔴", "Peor"
+                return "⚪", q
+
+            for _, row in wf2.iterrows():
+                regla = str(row.get("regla",""))
+                if regla.strip() == "":
+                    continue
+                val = _val_for_rule(regla)
+                delta = row.get("delta_pnl", np.nan)
+                ddm = row.get("mejora_dd", np.nan)
+                quad = row.get("cuadrante","")
+                emj, label = _emoji_for_quad(quad)
+                vtxt = f" = {val}" if val not in ("", None) else ""
+                try:
+                    d1 = f"{float(delta):+.0f}"
+                except Exception:
+                    d1 = "n/a"
+                try:
+                    d2 = f"{float(ddm):+.0f}"
+                except Exception:
+                    d2 = "n/a"
+                st.write(f"{emj} **{regla}{vtxt}** → {label} (ΔPnL {d1} / DD {d2})")
+
+        # Export CSV (parámetros + métricas + tabla what‑if si existe)
+        exp_rows = []
+        exp_rows.append({"section":"metrics","name":"trades_real","value": int(trades_real) if 'trades_real' in locals() else ""})
+        exp_rows.append({"section":"metrics","name":"trades_sim","value": int(trades_sim) if 'trades_sim' in locals() else ""})
+        exp_rows.append({"section":"metrics","name":"pnl_real","value": float(pnl_real) if 'pnl_real' in locals() else ""})
+        exp_rows.append({"section":"metrics","name":"pnl_sim","value": float(pnl_sim) if 'pnl_sim' in locals() else ""})
+        exp_rows.append({"section":"metrics","name":"dd_real","value": float(dd_real_mag) if 'dd_real_mag' in locals() else ""})
+        exp_rows.append({"section":"metrics","name":"dd_sim","value": float(dd_sim_mag) if 'dd_sim_mag' in locals() else ""})
+        exp_rows.append({"section":"params","name":"max_loss_per_day","value": max_loss})
+        exp_rows.append({"section":"params","name":"max_profit_per_day","value": max_profit})
+        exp_rows.append({"section":"params","name":"max_trades_per_day","value": max_trades})
+        exp_rows.append({"section":"params","name":"max_consec_losses","value": max_consec_losses})
+        exp_rows.append({"section":"params","name":"stop_big_loss_rr_le_-1","value": bool(stop_big_loss)})
+        exp_rows.append({"section":"params","name":"stop_big_win_rr_ge_2","value": bool(stop_big_win)})
+        exp_rows.append({"section":"filters","name":"active_filters","value": " | ".join(filter_notes) if filter_notes else ""})
+        if 'wf2' in locals() and isinstance(wf2, pd.DataFrame) and not wf2.empty:
+            for _, r in wf2.iterrows():
+                exp_rows.append({
+                    "section":"whatif",
+                    "name": str(r.get("regla","")),
+                    "value": "",
+                    "delta_pnl": r.get("delta_pnl", np.nan),
+                    "mejora_dd": r.get("mejora_dd", np.nan),
+                    "dias_cortados": r.get("dias_cortados", np.nan),
+                    "trades_sim": r.get("trades_sim", np.nan),
+                    "pf_sim": r.get("pf_sim", np.nan),
+                    "cuadrante": r.get("cuadrante","")
+                })
+
+        exp_df = pd.DataFrame(exp_rows)
+        csv_bytes = exp_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Descargar CSV del experimento", data=csv_bytes,
+                           file_name=f"lab_experimento_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                           mime="text/csv")
+
         with st.expander("Ver detalle por día (qué se omitió al cortar)"):
             show_cols = [
                 "fecha", "motivo",
@@ -3371,12 +3172,8 @@ else:
                 "pnl_total_dia_base", "pnl_hasta_stop", "pnl_omitido_por_corte", "delta_pnl_vs_base",
                 "dd_dia_base", "dd_dia_sim", "mejora_dd_dia",
             ]
-            cols_present = [c for c in show_cols if c in enriched.columns]
-            cols_missing = [c for c in show_cols if c not in enriched.columns]
-            if cols_missing:
-                st.caption('Columnas no disponibles en este dataset: ' + ', '.join(cols_missing))
             st.dataframe(
-                enriched[cols_present].sort_values(['fecha']) if cols_present else enriched.sort_values(['fecha']),
+                enriched[show_cols].sort_values(["fecha"]),
                 use_container_width=True,
                 hide_index=True,
             )
@@ -3388,6 +3185,11 @@ else:
         st.warning("Muestra pequeña tras filtros: toma estas conclusiones como hipótesis, no como regla.")
     if len(sim_kept) < max(10, int(0.25*len(filtered))):
         st.warning("La simulación está eliminando demasiados trades. Revisa si estás filtrando/cortando en exceso.")
+
+    # Magnitud de DD del simulado (por seguridad, siempre definida)
+    dd_sim_mag = _dd_mag_from_df(sim_kept) if (sim_kept is not None and not sim_kept.empty) else np.nan
+    # Magnitud de DD del real (por seguridad, siempre definida)
+    dd_base_f = _dd_mag_from_df(filtered) if (filtered is not None and not filtered.empty) else np.nan
 
     # OJO: dd_base/dd_sim son negativos (caída desde el pico). Para comparar "mejor/peor" usamos magnitudes.
     if (not np.isnan(dd_base_f)) and (not np.isnan(dd_sim_mag)) and dd_sim_mag < dd_base_f:
