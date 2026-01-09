@@ -2052,15 +2052,45 @@ def _apply_filters(df_in: pd.DataFrame):
         is_unknown = dnum.isna() | (dnum == 0)
 
         dir_opts = ["Venta", "Compra", "No definida"]
-        dir_default = st.session_state.get("lab_dirs_allowed", dir_opts)
-        sel_dirs = st.multiselect("Dirección permitida", dir_opts, default=dir_default, key="lab_dirs_allowed")
-
-        # Horas (entry preferido)
-        default_hours = st.session_state.get("lab_hours_allowed", hour_labels)
+        # Sanear defaults guardados de versiones anteriores
+        _dir_raw = st.session_state.get("lab_dirs_allowed", dir_opts)
+        if not isinstance(_dir_raw, (list, tuple)):
+            _dir_raw = dir_opts
+        _map_dir = {
+            "Largos": "Compra",
+            "Long": "Compra",
+            "Longs": "Compra",
+            "Cortos": "Venta",
+            "Short": "Venta",
+            "Shorts": "Venta",
+            "Sin datos": "No definida",
+            "Sin datos (faltó ENTRY)": "No definida",
+            "Sin datos (faltó Entry)": "No definida",
+            "Sin datos (faltó entry)": "No definida",
+            "No definida": "No definida",
+            "Compra": "Compra",
+            "Venta": "Venta",
+        }
+        _dir_sane = []
+        for v in _dir_raw:
+            v2 = _map_dir.get(str(v), None)
+            if v2 in dir_opts and v2 not in _dir_sane:
+                _dir_sane.append(v2)
+        if not _dir_sane:
+            _dir_sane = dir_opts.copy()
+        st.session_state["lab_dirs_allowed"] = _dir_sane
+        sel_dirs = st.multiselect("Dirección permitida", dir_opts, default=_dir_sane, key="lab_dirs_allowed")        # Horas (entry preferido)
+        _h_raw = st.session_state.get("lab_hours_allowed", hour_labels)
+        if not isinstance(_h_raw, (list, tuple)):
+            _h_raw = hour_labels
+        _h_sane = [h for h in _h_raw if h in hour_labels]
+        if not _h_sane:
+            _h_sane = hour_labels.copy()
+        st.session_state["lab_hours_allowed"] = _h_sane
         sel_hour_labels = st.multiselect(
             "Horas permitidas (entrada)",
             options=hour_labels,
-            default=default_hours,
+            default=_h_sane,
             key="lab_hours_allowed",
             help="Cada hora representa el bloque completo HH:00–HH:59. Si falta ENTRY, se usa EXIT como respaldo."
         )
