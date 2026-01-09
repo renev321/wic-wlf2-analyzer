@@ -2420,8 +2420,9 @@ with lab_left:
 # Objetivo: sugerir combinaciones simples (filtros + reglas) y permitir aplicarlas.
 # ─────────────────────────────────────────────────────────────────────────────
 with st.expander("🚀 Turbo Optimus Presets (A) — PnL / DD / Corr (1 click)", expanded=False):
-    st.caption("Se calculan presets rápidos y se ordenan por un puntaje balanceado (ΔPnL + mejora DD). "
-               "Cada preset ajusta filtros y/o reglas. Al aplicar, verás el resultado en 'Resultados del Lab'.")
+    st.caption("Turbo prueba muchas combinaciones y te devuelve el mejor preset encontrado para: 🚀 PnL, 🛟 DD o ⚖️ balance (PnL + DD + Corr). "
+               "No es una búsqueda exhaustiva global, pero sí optimiza dentro del set probado. "
+               "Al aplicar, verás el resultado en 'Resultados del Lab'.")
 
     # --- Helpers (sin widgets) ---
     def _dd_mag_from_pnl(pnl_series: pd.Series) -> float:
@@ -2631,6 +2632,43 @@ with st.expander("🚀 Turbo Optimus Presets (A) — PnL / DD / Corr (1 click)",
         return " | ".join(parts) if parts else "sin cambios"
 
     # --- Construir presets ---
+        # base_preset: baseline LAB settings (sin filtros / sin límites)
+    # - Usamos el estado actual si ya existe; si no, tomamos defaults amplios basados en el dataset.
+    def _turbo_build_base_preset(_df):
+        dirs_default = ["Compra", "Venta", "No definida"]
+        # hours labels (00:00..23:00) – si no hay horas en estado, usa todas
+        hours_default = [f"{h:02d}:00" for h in range(24)]
+        # OR / ATR ranges from data (full range)
+        or_col = _infer_col(_df, ["or_points", "or_pts", "or_range_pts", "or_range_points", "or_range", "or"])
+        atr_col = _infer_col(_df, ["atr_points", "atr_pts", "atr", "atr_range", "atr_range_pts", "atr_range_points"])
+        or_lo, or_hi = (0.0, 0.0)
+        atr_lo, atr_hi = (0.0, 0.0)
+        try:
+            if or_col and or_col in _df.columns:
+                or_lo, or_hi = _finite_minmax(_df[or_col])
+            if atr_col and atr_col in _df.columns:
+                atr_lo, atr_hi = _finite_minmax(_df[atr_col])
+        except Exception:
+            pass
+        # Prefer existing session_state (so baseline matches what the user currently sees)
+        ss = st.session_state
+        return {
+            "lab_max_loss": float(ss.get("lab_max_loss", 0.0) or 0.0),
+            "lab_max_profit": float(ss.get("lab_max_profit", 0.0) or 0.0),
+            "lab_max_trades": int(ss.get("lab_max_trades", 0) or 0),
+            "lab_max_consec_losses": int(ss.get("lab_max_consec_losses", 0) or 0),
+            "lab_stop_big_loss": bool(ss.get("lab_stop_big_loss", False)),
+            "lab_stop_big_win": bool(ss.get("lab_stop_big_win", False)),
+            "lab_include_missing": bool(ss.get("lab_include_missing", True)),
+            "lab_dirs_allowed": list(ss.get("lab_dirs_allowed", dirs_default)),
+            "lab_hours_allowed": list(ss.get("lab_hours_allowed", hours_default)),
+            "lab_or_rng": list(ss.get("lab_or_rng", [or_lo, or_hi])),
+            "lab_atr_rng": list(ss.get("lab_atr_rng", [atr_lo, atr_hi])),
+            "lab_avoid_no_support": bool(ss.get("lab_avoid_no_support", False)),
+        }
+    
+    base_preset = _turbo_build_base_preset(df_real)
+    
     presets = [("Baseline (1:1)", base_preset)]
 
     # Guardrails simples (rápidos)
