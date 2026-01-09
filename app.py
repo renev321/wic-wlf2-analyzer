@@ -2051,7 +2051,7 @@ def _apply_filters(df_in: pd.DataFrame):
         is_short = dnum < 0
         is_unknown = dnum.isna() | (dnum == 0)
 
-        dir_opts = ["Largos", "Cortos", "Sin datos"]
+        dir_opts = ["Venta", "Compra", "No definida"]
         dir_default = st.session_state.get("lab_dirs_allowed", dir_opts)
         sel_dirs = st.multiselect("Dirección permitida", dir_opts, default=dir_default, key="lab_dirs_allowed")
 
@@ -2070,46 +2070,14 @@ def _apply_filters(df_in: pd.DataFrame):
         or_rng = _range_slider_for("orSize", "lab_or_rng", "OR Size permitido", unit_hint="(según tu log)")
         atr_rng = _range_slider_for("atr", "lab_atr_rng", "ATR permitido", unit_hint="(según tu log)")
 
-        # EWO (umbral mínimo sobre |EWO|)
-        ewo_col = "ewo" if "ewo" in df.columns else ("ewoMag" if "ewoMag" in df.columns else None)
-        ewo_thr = None
-        if ewo_col:
-            ewo_abs = pd.to_numeric(df[ewo_col], errors="coerce").abs()
-            lo_ewo, hi_ewo = _finite_minmax(ewo_abs) if "_finite_minmax" in globals() else (None, None)
-            if lo_ewo is not None and hi_ewo is not None:
-                ewo_thr = st.slider("|EWO| mínimo", float(lo_ewo), float(hi_ewo), float(st.session_state.get("lab_ewo_thr", float(lo_ewo))), step=max((float(hi_ewo)-float(lo_ewo))/200.0, 0.0001), key="lab_ewo_thr")
-
-        # Absorción / Actividad (si existen)
-        abs_max = None
-        if "absorption" in df.columns:
-            lo_a, hi_a = _finite_minmax(df["absorption"]) if "_finite_minmax" in globals() else (None, None)
-            if lo_a is not None and hi_a is not None:
-                abs_max = st.slider("Absorción máxima (evitar extremos)", float(lo_a), float(hi_a), float(st.session_state.get("lab_abs_max", float(hi_a))), step=max((float(hi_a)-float(lo_a))/200.0, 0.01), key="lab_abs_max")
-
-        act_min = None
-        if "activity_rel" in df.columns:
-            lo_r, hi_r = _finite_minmax(df["activity_rel"]) if "_finite_minmax" in globals() else (None, None)
-            if lo_r is not None and hi_r is not None:
-                act_min = st.slider("Actividad mínima (volumen relativo antes de entrar)", float(lo_r), float(hi_r), float(st.session_state.get("lab_act_min", float(lo_r))), step=max((float(hi_r)-float(lo_r))/200.0, 0.0001), key="lab_act_min")
-
-        # Evitar "sin apoyo" (si existe una columna compatible)
-        no_support_col = None
-        for c in ["noSupport", "sinApoyo", "no_support", "no_support_flag"]:
-            if c in df.columns:
-                no_support_col = c
-                break
-        avoid_no_support = False
-        if no_support_col:
-            avoid_no_support = st.checkbox("Evitar 'sin apoyo' (presión vs avance en contra)", value=bool(st.session_state.get("lab_avoid_no_support", False)), key="lab_avoid_no_support")
-
     # --- aplicar filtros ---
     # Dirección
     dir_mask = pd.Series(False, index=df.index)
-    if "Largos" in sel_dirs:
+    if "Compra" in sel_dirs:
         dir_mask |= is_long
-    if "Cortos" in sel_dirs:
+    if "Venta" in sel_dirs:
         dir_mask |= is_short
-    if "Sin datos" in sel_dirs:
+    if "No definida" in sel_dirs:
         dir_mask |= is_unknown
     if dir_mask.any():
         df = df[dir_mask].copy()
@@ -2128,36 +2096,131 @@ def _apply_filters(df_in: pd.DataFrame):
     df = _apply_range_mask(df, "orSize", or_rng)
     df = _apply_range_mask(df, "atr", atr_rng)
 
-    # EWO min
-    if ewo_col and ewo_thr is not None:
-        s = pd.to_numeric(df[ewo_col], errors="coerce").abs()
-        mask = s >= float(ewo_thr)
-        if include_missing:
-            mask = mask | s.isna()
-        df = df[mask].copy()
-
-    # Absorción max
-    if "absorption" in df.columns and abs_max is not None:
-        s = pd.to_numeric(df["absorption"], errors="coerce")
-        mask = s <= float(abs_max)
-        if include_missing:
-            mask = mask | s.isna()
-        df = df[mask].copy()
-
-    # Actividad min
-    if "activity_rel" in df.columns and act_min is not None:
-        df = _apply_min_mask(df, "activity_rel", act_min)
-
-    # Evitar sin apoyo
-    if no_support_col and avoid_no_support:
-        s = df[no_support_col]
-        # tratamos True/1/"true" como "sin apoyo" (mal) -> excluir
-        bad = s.astype(str).str.lower().isin(["1", "true", "t", "y", "yes"])
-        if include_missing:
-            bad = bad.fillna(False)
-        df = df[~bad].copy()
-
     return df, notes
+
+
+def _simulate_daily_rules(df_in: pd.DataFrame,
+                          max_loss: float = 0.0,
+                          max_profit: float = 0.0,
+                          max_trades: int = 0,
+                          max_consec_losses: int = 0,
+                          stop_big_loss: bool = False,
+                          stop_big_win: bool = False):
+    """
+    Simula reglas tipo 'Daily Guard' sobre un dataframe ya filtrado.
+
+    - max_loss: corta el día cuando el PnL acumulado <= -max_loss (0 = sin límite)
+    - max_profit: corta el día cuando el PnL acumulado >= max_profit (0 = sin límite)
+    - max_trades: corta el día tras N trades ejecutados (0 = sin límite)
+    - max_consec_losses: corta el día tras N pérdidas seguidas (0 = sin límite)
+    - stop_big_loss: corta el día después de un trade con RR <= -1
+    - stop_big_win: corta el día después de un trade con RR >= 2
+
+    Devuelve:
+      sim_kept: trades que “quedarían” tras aplicar reglas (incluye el trade que gatilla el corte)
+      stops_df: una fila por día cortado con métricas básicas (para explicar impacto)
+    """
+    if df_in is None or df_in.empty:
+        return (pd.DataFrame() if df_in is None else df_in.copy()), pd.DataFrame()
+
+    df = df_in.copy()
+
+    # Columna de tiempo para ordenar (ENTRY preferido; fallback EXIT)
+    ts_entry = pd.to_datetime(df["entry_time"], errors="coerce") if "entry_time" in df.columns else pd.Series(pd.NaT, index=df.index)
+    ts_exit  = pd.to_datetime(df["exit_time"],  errors="coerce") if "exit_time"  in df.columns else pd.Series(pd.NaT, index=df.index)
+
+    df["_sim_ts"] = ts_entry
+    df.loc[df["_sim_ts"].isna(), "_sim_ts"] = ts_exit[df["_sim_ts"].isna()]
+
+    # Trades sin timestamp: no se pueden agrupar por día -> se conservan tal cual
+    df_valid = df[df["_sim_ts"].notna()].copy()
+    df_other = df[df["_sim_ts"].isna()].copy()
+
+    if df_valid.empty:
+        sim_kept = df_other.copy()
+        sim_kept.drop(columns=["_sim_ts"], errors="ignore", inplace=True)
+        return sim_kept, pd.DataFrame()
+
+    df_valid = df_valid.sort_values("_sim_ts").copy()
+    df_valid["day"] = df_valid["_sim_ts"].dt.date
+
+    # Normaliza números
+    if "tradeRealized" in df_valid.columns:
+        df_valid["tradeRealized"] = pd.to_numeric(df_valid["tradeRealized"], errors="coerce").fillna(0.0).astype(float)
+    else:
+        df_valid["tradeRealized"] = 0.0
+
+    rr_series = pd.to_numeric(df_valid["rr"], errors="coerce") if "rr" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
+
+    kept_idx = []
+    stop_rows = []
+
+    max_loss = float(max_loss or 0.0)
+    max_profit = float(max_profit or 0.0)
+    max_trades = int(max_trades or 0)
+    max_consec_losses = int(max_consec_losses or 0)
+
+    for d, sub in df_valid.groupby("day", sort=True):
+        sub = sub.sort_values("_sim_ts")
+        total = int(len(sub))
+        cum = 0.0
+        consec = 0
+        taken = 0
+        cut_reason = None
+
+        for i, (idx, row) in enumerate(sub.iterrows(), start=1):
+            pnl = float(row.get("tradeRealized", 0.0) or 0.0)
+            rr  = rr_series.loc[idx] if idx in rr_series.index else np.nan
+
+            taken += 1
+            cum += pnl
+            if pnl < 0:
+                consec += 1
+            else:
+                consec = 0
+
+            kept_idx.append(idx)
+
+            # Si ya no hay más trades, no tiene sentido marcar corte
+            has_more = taken < total
+
+            if has_more and cut_reason is None:
+                if max_trades > 0 and taken >= max_trades:
+                    cut_reason = "Máx trades/día"
+                elif max_loss > 0 and cum <= -abs(max_loss):
+                    cut_reason = "Máx pérdida/día"
+                elif max_profit > 0 and cum >= abs(max_profit):
+                    cut_reason = "Máx ganancia/día"
+                elif max_consec_losses > 0 and consec >= max_consec_losses:
+                    cut_reason = f"{max_consec_losses} pérdidas seguidas"
+                elif bool(stop_big_loss) and np.isfinite(rr) and float(rr) <= -1.0:
+                    cut_reason = "Stop‑out fuerte (≤ -1R)"
+                elif bool(stop_big_win) and np.isfinite(rr) and float(rr) >= 2.0:
+                    cut_reason = "Ganador grande (≥ 2R)"
+
+            if cut_reason is not None:
+                # Registramos el corte (el trade que gatilla el corte está incluido)
+                stop_rows.append({
+                    "fecha": d,
+                    "day": d,
+                    "motivo": cut_reason,
+                    "trades_totales_dia": total,
+                    "trades_ejecutados": taken,
+                    "trades_filtrados_por_stop": int(total - taken),
+                    "pnl_hasta_stop": float(cum),
+                })
+                break  # cortar el resto del día
+
+    sim_kept_valid = df_valid.loc[kept_idx].copy() if kept_idx else df_valid.iloc[0:0].copy()
+    sim_kept = pd.concat([sim_kept_valid, df_other], axis=0, ignore_index=False)
+
+    # Limpieza auxiliares
+    sim_kept.drop(columns=["_sim_ts"], errors="ignore", inplace=True)
+
+    stops_df = pd.DataFrame(stop_rows)
+    return sim_kept, stops_df
+
+
 def _reset_lab_state(base_df: pd.DataFrame):
     """Resetea el Lab para que arranque 1:1 con el Resumen rápido (REAL vs SIMULADO sin cortes)."""
     if base_df is None:
@@ -2227,17 +2290,13 @@ def _reset_lab_state(base_df: pd.DataFrame):
 
     hour_labels = [_hour_label(h) for h in avail_hours]
     st.session_state["lab_hours_allowed"] = hour_labels[:]
-    st.session_state["lab_dirs_allowed"] = ["Largos", "Cortos", "Sin datos"]
+    st.session_state["lab_dirs_allowed"] = ["Venta", "Compra", "No definida"]
     st.session_state["lab_include_missing"] = True
 
 
     # Rangos numéricos -> por defecto NO filtra (rango completo / umbral mínimo)
     st.session_state["lab_or_rng"] = _minmax("orSize")
     st.session_state["lab_atr_rng"] = _minmax("atr")
-    st.session_state["lab_ewo_thr"] = _min_abs("ewo", default=0.0)
-    st.session_state["lab_abs_max"] = _max_val("pre_absorcion", default=0.0)
-    st.session_state["lab_act_min"] = _min_val("pre_actividad_rel", default=0.0)
-    st.session_state["lab_avoid_sin_apoyo"] = False
 
 
 
